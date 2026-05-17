@@ -175,30 +175,45 @@ class VideoReceiver:
             logger.info("Using software H.264 decoder: avdec_h264")
             return "avdec_h264 max-threads=4 ! "
         logger.warning("avdec_h264 not found — falling back to vah264dec")
-        return "vah264dec ! "
+        # 'video/x-raw' forces the VA decoder to download to system memory
+        # so the downstream videoconvert can accept the frames.
+        return "vah264dec ! video/x-raw ! "
 
     @staticmethod
     def _pick_sink() -> str:
-        """Choose the display sink. kmssink renders directly via DRM/KMS."""
+        """Choose the display sink. kmssink renders directly via DRM/KMS and
+        scales the frame to the panel with the display controller's hardware
+        scaler (can-scale=true) — no per-frame software scaling."""
         if Gst.ElementFactory.find('kmssink'):
-            return "kmssink sync=false force-modesetting=true"
+            return ("kmssink sync=false force-modesetting=true "
+                    "can-scale=true")
         logger.warning("kmssink not found — falling back to autovideosink")
         return "autovideosink sync=false"
 
     def _build_pipeline(self) -> Gst.Pipeline:
         desc = (
-            f'udpsrc port={self.video_port} caps="{RTP_CAPS}" ! '
-            # 200ms jitterbuffer — forgiving of Wi-Fi jitter (a monitor can
-            # afford the latency; an aggressive buffer just drops frames).
-            'rtpjitterbuffer latency=200 ! '
+            # buffer-size: a 4 MB kernel receive buffer rides out bursts so
+            # the socket does not overflow (overflow = dropped RTP packets =
+            # macroblock "glitch" artifacts).
+            f'udpsrc port={self.video_port} buffer-size=4194304 '
+            f'caps="{RTP_CAPS}" ! '
+            # 150ms jitterbuffer: large enough that late/out-of-order packets
+            # are still delivered (dropping H.264 packets corrupts the
+            # picture), small enough not to dominate latency.
+            'rtpjitterbuffer latency=150 ! '
             'rtph264depay ! h264parse ! '
             + self._pick_decoder() +
-            # Force system-memory raw: the VA-API decoder (vah264dec) emits
-            # VAMemory frames that plain videoconvert cannot accept, which
-            # fails the pipeline with 'not-negotiated'. This capsfilter makes
-            # the decoder download to system memory first.
-            'video/x-raw ! videoconvert ! videoscale ! '
-            f'video/x-raw,width={self.width},height={self.height} ! '
+            # Leaky queue on *decoded* frames: if the display ever falls
+            # behind, drop the oldest raw frame so latency cannot grow
+            # without bound. Leaking raw frames is safe (a skipped frame);
+            # leaking encoded frames would corrupt the stream.
+            'queue leaky=downstream max-size-buffers=3 max-size-time=0 '
+            'max-size-bytes=0 ! '
+            'videoconvert ! '
+            # No software videoscale — kmssink hardware-scales to the panel.
+            # Software upscaling every frame to 2736x1824 was the receiver's
+            # CPU bottleneck: it starved the decoder, overflowed the UDP
+            # socket and accumulated latency.
             + self._pick_sink()
         )
         logger.info(f"Pipeline: {desc}")

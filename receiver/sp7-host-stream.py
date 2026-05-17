@@ -50,7 +50,9 @@ DEFAULT_VIDEO_PORT = 5004
 DEFAULT_INPUT_PORT = 5005
 DISCOVERY_PORT = 5006
 DEFAULT_FPS = 30
-DEFAULT_BITRATE = 12000  # kbps
+# 8 Mbps: 12 Mbps saturated typical 2.4/5GHz Wi-Fi, causing bursty packet
+# loss (H.264 macroblock glitches). 8 Mbps leaves headroom for the link.
+DEFAULT_BITRATE = 8000  # kbps
 
 
 def discover_surface(timeout: float = 6.0) -> Optional[str]:
@@ -108,31 +110,49 @@ def detect_capture_source() -> str:
 
 
 def build_capture_pipeline(source: str, fps: int, bitrate: int,
-                           target_ip: str, target_port: int) -> str:
-    """Assemble the capture -> H.264 -> RTP/UDP pipeline."""
+                           target_ip: str, target_port: int,
+                           width: int = 0) -> str:
+    """Assemble the capture -> H.264 -> RTP/UDP pipeline.
+
+    Encoders are tuned for low latency: no B-frames (they require
+    reordering, which adds a frame of delay), one reference frame, a
+    keyframe every second so the picture self-heals quickly after any
+    packet loss, and the fastest speed preset."""
     enc = detect_encoder()
     if enc == 'x264enc':
         encstr = (f'x264enc bitrate={bitrate} speed-preset=ultrafast '
-                  f'tune=zerolatency key-int-max={fps * 2}')
+                  f'tune=zerolatency key-int-max={fps} bframes=0 '
+                  f'sliced-threads=true')
     elif enc == 'vaapih264enc':
         encstr = (f'vaapih264enc rate-control=cbr bitrate={bitrate} '
                   f'keyframe-period={fps}')
     elif enc == 'vah264enc':
-        encstr = f'vah264enc bitrate={bitrate} key-int-max={fps} ref-frames=1'
+        encstr = (f'vah264enc rate-control=cbr bitrate={bitrate} '
+                  f'target-usage=7 key-int-max={fps} ref-frames=1 '
+                  f'b-frames=0')
     elif enc == 'nvh264enc':
-        encstr = f'nvh264enc bitrate={bitrate} gop-size={fps * 2} bframes=0'
+        encstr = (f'nvh264enc bitrate={bitrate} gop-size={fps} '
+                  f'bframes=0 rc-mode=cbr zerolatency=true')
     else:
         encstr = enc
 
-    # No videorate: it stalls on wf-recorder's y4m output (the avformat
-    # timebase confuses rate negotiation). The desktop is streamed at its
-    # native refresh rate, which is what a monitor wants anyway.
-    # No pinned pixel format: videoconvert negotiates whatever the chosen
-    # encoder accepts (I420 for x264enc, NV12 for the VA-API encoders).
+    # Optional downscale before encoding. Default (width=0) streams the
+    # capture at native resolution; the receiver hardware-scales it to the
+    # Surface panel. videoscale with only the width pinned keeps the aspect
+    # ratio. width must be even (H.264 requires even dimensions).
+    scale = ''
+    if width and width > 0:
+        scale = f"videoscale ! video/x-raw,width={width} ! "
+
+    # Leaky queue on raw frames: if the encoder ever falls behind, drop the
+    # oldest captured frame rather than letting latency grow. config-interval
+    # -1 sends SPS/PPS with every keyframe so the decoder can resync fast.
     pipeline = (
-        f"{source} ! videoconvert ! videoscale ! {encstr} ! "
-        f"h264parse config-interval=1 ! "
-        f"rtph264pay pt=96 mtu=1400 config-interval=1 ! "
+        f"{source} ! queue leaky=downstream max-size-buffers=3 "
+        f"max-size-time=0 max-size-bytes=0 ! "
+        f"{scale}videoconvert ! {encstr} ! "
+        f"h264parse config-interval=-1 ! "
+        f"rtph264pay pt=96 mtu=1400 config-interval=-1 ! "
         f"udpsink host={target_ip} port={target_port} sync=false"
     )
     logger.info(f"Encoder: {enc}")
@@ -205,19 +225,21 @@ class WfRecorderCapture:
 # Video streamer
 # ---------------------------------------------------------------------------
 class VideoStreamer:
-    def __init__(self, target_ip, video_port, source, fps, bitrate):
+    def __init__(self, target_ip, video_port, source, fps, bitrate, width=0):
         self.target_ip = target_ip
         self.video_port = video_port
         self.source = source
         self.fps = fps
         self.bitrate = bitrate
+        self.width = width
         self.pipeline: Optional[Gst.Pipeline] = None
         self.loop: Optional[GLib.MainLoop] = None
 
     def start(self):
         Gst.init(None)
         desc = build_capture_pipeline(self.source, self.fps, self.bitrate,
-                                      self.target_ip, self.video_port)
+                                      self.target_ip, self.video_port,
+                                      self.width)
         self.pipeline = Gst.parse_launch(desc)
         bus = self.pipeline.get_bus()
         bus.add_signal_watch()
@@ -406,7 +428,7 @@ class ServiceAdvertiser:
 # ---------------------------------------------------------------------------
 class HostServer:
     def __init__(self, target_ip, video_port, input_port, source,
-                 fps, bitrate, enable_input):
+                 fps, bitrate, enable_input, width=0):
         self.target_ip = target_ip
         self.video_port = video_port
         self.input_port = input_port
@@ -414,6 +436,7 @@ class HostServer:
         self.fps = fps
         self.bitrate = bitrate
         self.enable_input = enable_input
+        self.width = width
         self.streamer = None
         self.input_server = None
         self.advertiser = None
@@ -432,7 +455,8 @@ class HostServer:
             self.input_server = InputServer(self.input_port)
             self.input_server.start()
         self.streamer = VideoStreamer(self.target_ip, self.video_port,
-                                      self.source, self.fps, self.bitrate)
+                                      self.source, self.fps, self.bitrate,
+                                      self.width)
         self.streamer.start()
         logger.info("Host server running — Ctrl+C to stop")
 
@@ -473,6 +497,10 @@ def main():
     parser.add_argument('--fps', type=int, default=DEFAULT_FPS)
     parser.add_argument('--bitrate', type=int, default=DEFAULT_BITRATE,
                         help='kbps (default: %(default)s)')
+    parser.add_argument('--width', type=int, default=0,
+                        help='downscale capture to this width before '
+                             'encoding (even number; 0 = native, default). '
+                             'Lower it if Wi-Fi cannot keep up.')
     parser.add_argument('--no-input', action='store_true',
                         help='Disable pen/touch input reception')
     parser.add_argument('--verbose', '-v', action='store_true')
@@ -516,7 +544,8 @@ def main():
             source = 'videotestsrc is-live=true pattern=ball'
 
     server = HostServer(target, args.video_port, args.input_port,
-                        source, args.fps, args.bitrate, not args.no_input)
+                        source, args.fps, args.bitrate, not args.no_input,
+                        args.width)
     server.capture = capture
     signal.signal(signal.SIGINT, lambda *_: server.stop())
     signal.signal(signal.SIGTERM, lambda *_: server.stop())
