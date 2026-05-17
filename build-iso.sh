@@ -381,7 +381,7 @@ grub-mkimage \
     --config="${BUILD_DIR}/early.cfg" \
     efi_gop efi_uga fat iso9660 part_gpt part_msdos \
     normal boot linux configfile loopback chain \
-    efifwsetup efi_net keystatus gfxmenu regexp \
+    efifwsetup keystatus gfxmenu regexp \
     gfxterm all_video font read echo file test \
     multiboot search search_fs_file search_fs_uuid \
     search_label xfs gzio lvm ls reboot halt help \
