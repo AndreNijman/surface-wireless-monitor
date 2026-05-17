@@ -247,6 +247,17 @@ is not yet packaged in this repository — track it as future work.
 python3 receiver/sp7-host-stream.py --target <SURFACE_IP> --verbose
 ```
 
+Run it in the foreground like that for a quick test — but note it dies
+when its terminal (or SSH session) closes. For normal use, run it
+**detached** so it keeps streaming on its own:
+
+```bash
+sp7-host --daemon          # start, detached — survives the terminal
+sp7-host --stop            # stop the running daemon
+```
+
+The daemon logs to `/tmp/sp7-host.log`.
+
 The streamer auto-detects how to capture the screen:
 
 - **X11 host** → `ximagesrc` (automatic, no extra setup).

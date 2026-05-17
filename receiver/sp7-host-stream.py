@@ -18,6 +18,13 @@ Start in a mode with --mode extend|mirror (or --mirror). Switch a running
 host between the two at any time with `sp7-host-stream.py --toggle`, which
 signals the running instance (no restart, no dropped connection).
 
+Running it persistently
+-----------------------
+--daemon detaches into the background so the stream survives the terminal
+(or SSH session) that launched it. --stop ends a running daemon, --toggle
+switches its mode. Without --daemon the host runs in the foreground and
+dies when its terminal closes.
+
 Capture sources
 ---------------
 * X11 sessions: `ximagesrc` works directly (mirror only).
@@ -25,8 +32,8 @@ Capture sources
   existing output — is captured via wf-recorder (wlr-screencopy).
 
 Usage: sp7-host-stream.py [--target <SP7_IP>] [--mode extend|mirror]
-                          [--toggle] [--display WxH] [--fps N]
-                          [--bitrate KBPS] [--width W] [--no-input] [-v]
+                          [--daemon] [--stop] [--toggle] [--display WxH]
+                          [--fps N] [--bitrate KBPS] [--width W] [-v]
 """
 
 import os
@@ -76,8 +83,10 @@ DEFAULT_DISPLAY_H = 1080
 TOUCH_DEVICE_NAME = 'SP7 Virtual Touchscreen'
 TOUCH_DEVICE_HYPR = 'sp7-virtual-touchscreen'
 
-# pidfile — lets `sp7-host --toggle` find a running instance to signal.
+# pidfile + logfile — let `sp7-host --toggle/--stop` find a running
+# instance, and give `--daemon` somewhere to write its output.
 PIDFILE = '/tmp/sp7-host.pid'
+LOGFILE = '/tmp/sp7-host.log'
 
 
 def discover_surface(timeout: float = 6.0) -> Optional[str]:
@@ -774,17 +783,53 @@ class HostServer:
             self.stop()
 
 
-def _toggle_running_instance() -> int:
-    """Signal an already-running host to switch display mode."""
+def _signal_running_instance(sig: int) -> Optional[int]:
+    """Send `sig` to a running host instance (found via PIDFILE). Returns
+    the pid signalled, or None if no live instance was found."""
     try:
         with open(PIDFILE) as f:
             pid = int(f.read().strip())
-        os.kill(pid, signal.SIGUSR1)
+        os.kill(pid, sig)
+        return pid
+    except (FileNotFoundError, ValueError, ProcessLookupError,
+            PermissionError):
+        return None
+
+
+def _toggle_running_instance() -> int:
+    pid = _signal_running_instance(signal.SIGUSR1)
+    if pid:
         print(f"Sent display-mode switch to sp7-host (pid {pid}).")
         return 0
-    except (FileNotFoundError, ValueError, ProcessLookupError, PermissionError):
-        print("No running sp7-host instance found.", file=sys.stderr)
-        return 1
+    print("No running sp7-host instance found.", file=sys.stderr)
+    return 1
+
+
+def _stop_running_instance() -> int:
+    pid = _signal_running_instance(signal.SIGTERM)
+    if pid:
+        print(f"Stopped sp7-host (pid {pid}).")
+        return 0
+    print("No running sp7-host instance found.", file=sys.stderr)
+    return 1
+
+
+def _daemonize() -> None:
+    """Double-fork into a detached background process so the host survives
+    the terminal (or session) that launched it. stdio -> LOGFILE."""
+    if os.fork() > 0:
+        os._exit(0)              # original process: returns the shell prompt
+    os.setsid()
+    if os.fork() > 0:
+        os._exit(0)              # intermediate: exits so the daemon is
+                                 # reparented to init, fully detached
+    sys.stdout.flush()
+    sys.stderr.flush()
+    log = open(LOGFILE, 'a', buffering=1)
+    null = open(os.devnull, 'r')
+    os.dup2(null.fileno(), sys.stdin.fileno())
+    os.dup2(log.fileno(), sys.stdout.fileno())
+    os.dup2(log.fileno(), sys.stderr.fileno())
 
 
 def main():
@@ -815,6 +860,11 @@ def main():
     parser.add_argument('--toggle', action='store_true',
                         help='tell a running sp7-host to switch between '
                              'extend and mirror, then exit')
+    parser.add_argument('--daemon', action='store_true',
+                        help=f'run detached in the background, surviving the '
+                             f'terminal (log: {LOGFILE})')
+    parser.add_argument('--stop', action='store_true',
+                        help='stop a running background sp7-host, then exit')
     parser.add_argument('--display',
                         default=f'{DEFAULT_DISPLAY_W}x{DEFAULT_DISPLAY_H}',
                         help='extended-display resolution WxH '
@@ -826,9 +876,15 @@ def main():
 
     if args.toggle:
         sys.exit(_toggle_running_instance())
+    if args.stop:
+        sys.exit(_stop_running_instance())
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
+
+    if _signal_running_instance(0) is not None:
+        logger.error("sp7-host is already running — use --toggle or --stop.")
+        sys.exit(1)
 
     target = args.target
     if not target:
@@ -838,6 +894,14 @@ def main():
                           "Wi-Fi to connect, or pass --target <ip>.")
             sys.exit(1)
         logger.info(f"Found Surface at {target}")
+
+    # Detach into the background *after* discovery (so any "no Surface"
+    # error is visible in the user's terminal) but *before* the pidfile
+    # and signal handlers, so they belong to the daemon process.
+    if args.daemon:
+        print(f"sp7-host: streaming to {target} in the background "
+              f"(log: {LOGFILE}; stop with 'sp7-host --stop').")
+        _daemonize()
 
     Gst.init(None)
 
