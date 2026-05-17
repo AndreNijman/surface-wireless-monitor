@@ -176,14 +176,14 @@ EOF
 
 # Add linux-surface repository
 cat > "${CHROOT_DIR}/etc/apt/sources.list.d/linux-surface.list" << 'EOF'
-deb [arch=amd64 signed-by=/usr/share/keyrings/linux-surface-archive-keyring.gpg] https://pkg.surfacelinux.com/debian release main
+deb [arch=amd64 signed-by=/usr/share/keyrings/linux-surface.asc] https://pkg.surfacelinux.com/debian release main
 EOF
 
 # Add linux-surface GPG key
 chroot "${CHROOT_DIR}" bash -c '
     mkdir -p /usr/share/keyrings
-    curl -fsSL https://raw.githubusercontent.com/linux-surface/linux-surface/master/pkg/keys/surface-archive-keyring.gpg \
-        -o /usr/share/keyrings/linux-surface-archive-keyring.gpg
+    curl -fsSL https://raw.githubusercontent.com/linux-surface/linux-surface/master/pkg/keys/surface.asc \
+        -o /usr/share/keyrings/linux-surface.asc
 '
 
 # Update and install surface packages

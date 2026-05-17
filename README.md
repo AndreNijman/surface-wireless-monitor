@@ -418,6 +418,7 @@ onward each change is a git commit.
 | **v7** | `debootstrap`: added `--components=main,contrib,non-free,non-free-firmware` so firmware/VA-API packages resolve; removed the non-existent `python3-asyncio` package. |
 | **v8** | Removed the VA-API driver variants `i965-va-driver-shaders` and `intel-media-va-driver-non-free` from the debootstrap include list — they `Conflict` with the standard drivers pulled in by `va-driver-all`, and debootstrap's raw `dpkg` cannot resolve that the way `apt` can. |
 | **v9** | Pre-load Wi-Fi and SSH: added `network-manager` and `openssh-server`, dropped `dhcpcd5`; the build now overlays a git-ignored `overlay-local/` tree carrying NetworkManager connections and `authorized_keys`, and enables the `NetworkManager` and `ssh` services. |
+| **v10** | Fixed the linux-surface signing-key fetch: the old `surface-archive-keyring.gpg` path now 404s. Switched to the current `pkg/keys/surface.asc` (ASCII-armored) and pointed apt's `signed-by=` straight at the `.asc` (supported in bookworm — no `gpg --dearmor` step needed). |
 
 ---
 
