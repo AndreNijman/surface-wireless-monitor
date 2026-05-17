@@ -277,37 +277,24 @@ class VideoStreamer:
 # Input server — receives pen/touch from the SP7, injects via uinput
 # ---------------------------------------------------------------------------
 class InputServer:
+    """Receives pen/touch packets from the Surface and replays them on the
+    host through a virtual *touchscreen* (uinput).
+
+    It is deliberately a touchscreen, not a pen/tablet: a virtual tablet was
+    not picked up by the compositor at all (empty Tablets list). A
+    touchscreen — INPUT_PROP_DIRECT plus the multitouch type-B protocol — is
+    the same device class as a real laptop touchscreen, which the compositor
+    handles out of the box."""
+
+    ABS_MAX = 32767  # logical coord range; libinput maps it onto the output
+
     def __init__(self, port: int):
         self.port = port
         self._running = False
         self._socket: Optional[socket.socket] = None
         self._uinput = None
-        self.screen_w, self.screen_h = self._screen_size()
-
-    @staticmethod
-    def _screen_size() -> tuple:
-        # Hyprland
-        try:
-            import json
-            out = subprocess.run(['hyprctl', '-j', 'monitors'],
-                                 capture_output=True, text=True, timeout=5)
-            mons = json.loads(out.stdout)
-            if mons:
-                m = mons[0]
-                return int(m['width']), int(m['height'])
-        except Exception:
-            pass
-        # X11 / XWayland
-        try:
-            out = subprocess.run(['xrandr'], capture_output=True,
-                                 text=True, timeout=5)
-            for line in out.stdout.splitlines():
-                if '*' in line:
-                    w, h = line.split()[0].split('x')
-                    return int(w), int(h)
-        except Exception:
-            pass
-        return 1920, 1080
+        self._slots: dict = {}   # slot -> {'touching': bool}
+        self._tid = 0            # monotonic MT tracking-id counter
 
     def _setup_uinput(self) -> bool:
         try:
@@ -315,18 +302,24 @@ class InputServer:
         except ImportError:
             logger.error("python-evdev not installed — input injection off")
             return False
+        m = self.ABS_MAX
         cap = {
-            e.EV_KEY: [e.BTN_TOOL_PEN, e.BTN_TOUCH, e.BTN_STYLUS],
+            e.EV_KEY: [e.BTN_TOUCH],
             e.EV_ABS: [
-                (e.ABS_X, AbsInfo(0, 0, self.screen_w, 0, 0, 0)),
-                (e.ABS_Y, AbsInfo(0, 0, self.screen_h, 0, 0, 0)),
-                (e.ABS_PRESSURE, AbsInfo(0, 0, 4095, 0, 0, 0)),
-                (e.ABS_TILT_X, AbsInfo(0, -90, 90, 0, 0, 0)),
-                (e.ABS_TILT_Y, AbsInfo(0, -90, 90, 0, 0, 0)),
+                (e.ABS_X, AbsInfo(0, 0, m, 0, 0, 0)),
+                (e.ABS_Y, AbsInfo(0, 0, m, 0, 0, 0)),
+                (e.ABS_MT_SLOT, AbsInfo(0, 0, 9, 0, 0, 0)),
+                (e.ABS_MT_POSITION_X, AbsInfo(0, 0, m, 0, 0, 0)),
+                (e.ABS_MT_POSITION_Y, AbsInfo(0, 0, m, 0, 0, 0)),
+                # min -1: the kernel's "contact lifted" sentinel must not be
+                # clamped away by uinput's range enforcement.
+                (e.ABS_MT_TRACKING_ID, AbsInfo(0, -1, 65535, 0, 0, 0)),
             ],
         }
         try:
-            self._uinput = UInput(cap, name='SP7 Virtual Pen', version=0x3)
+            self._uinput = UInput(cap, name='SP7 Virtual Touchscreen',
+                                  input_props=[e.INPUT_PROP_DIRECT],
+                                  version=0x3)
         except PermissionError:
             logger.error("No permission for /dev/uinput — run as root or add "
                           "the user to the 'input' group")
@@ -334,23 +327,41 @@ class InputServer:
         except Exception as ex:
             logger.error(f"uinput setup failed: {ex}")
             return False
-        logger.info(f"uinput pen device created ({self.screen_w}x{self.screen_h})")
+        logger.info("uinput virtual touchscreen created")
         return True
 
     def _inject(self, pkt: dict):
+        """Replay one packet via the type-B multitouch protocol. Each source
+        digitizer owns its own slot, so an idle device's tip=False never
+        cancels another device's active contact."""
         from evdev import ecodes as e
         d = self._uinput
-        x = max(0, min(self.screen_w, int(pkt.get('x', 0) * self.screen_w)))
-        y = max(0, min(self.screen_h, int(pkt.get('y', 0) * self.screen_h)))
-        d.write(e.EV_ABS, e.ABS_X, x)
-        d.write(e.EV_ABS, e.ABS_Y, y)
-        d.write(e.EV_ABS, e.ABS_PRESSURE,
-                max(0, min(4095, int(pkt.get('p', 0) * 4095))))
-        d.write(e.EV_ABS, e.ABS_TILT_X, max(-90, min(90, int(pkt.get('tx', 0) * 90))))
-        d.write(e.EV_ABS, e.ABS_TILT_Y, max(-90, min(90, int(pkt.get('ty', 0) * 90))))
-        d.write(e.EV_KEY, e.BTN_TOOL_PEN, 1 if pkt.get('rng') else 0)
-        d.write(e.EV_KEY, e.BTN_TOUCH, 1 if pkt.get('tip') else 0)
-        d.write(e.EV_KEY, e.BTN_STYLUS, 1 if pkt.get('btn') else 0)
+        slot = min(9, max(0, int(pkt.get('slot', 0))))
+        tip = bool(pkt.get('tip'))
+        st = self._slots.setdefault(slot, {'touching': False})
+        if not tip and not st['touching']:
+            return  # idle — nothing to report for this slot
+        x = max(0, min(self.ABS_MAX, int(pkt.get('x', 0.0) * self.ABS_MAX)))
+        y = max(0, min(self.ABS_MAX, int(pkt.get('y', 0.0) * self.ABS_MAX)))
+        d.write(e.EV_ABS, e.ABS_MT_SLOT, slot)
+        if tip and not st['touching']:            # contact begins
+            st['touching'] = True
+            self._tid = (self._tid + 1) & 0xffff
+            d.write(e.EV_ABS, e.ABS_MT_TRACKING_ID, self._tid)
+            d.write(e.EV_ABS, e.ABS_MT_POSITION_X, x)
+            d.write(e.EV_ABS, e.ABS_MT_POSITION_Y, y)
+        elif tip:                                 # contact moves
+            d.write(e.EV_ABS, e.ABS_MT_POSITION_X, x)
+            d.write(e.EV_ABS, e.ABS_MT_POSITION_Y, y)
+        else:                                     # contact ends
+            st['touching'] = False
+            d.write(e.EV_ABS, e.ABS_MT_TRACKING_ID, -1)
+        if tip:
+            d.write(e.EV_ABS, e.ABS_X, x)
+            d.write(e.EV_ABS, e.ABS_Y, y)
+        # BTN_TOUCH reflects whether *any* contact is currently down.
+        any_touch = any(s['touching'] for s in self._slots.values())
+        d.write(e.EV_KEY, e.BTN_TOUCH, 1 if any_touch else 0)
         d.syn()
 
     def _loop(self):

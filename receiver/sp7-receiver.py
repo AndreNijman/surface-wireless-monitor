@@ -357,7 +357,8 @@ class InputForwarder:
                         f"[{'touch' if t else 'pen'}]")
         return useful
 
-    def _capture_loop(self, device_path: str, is_touch: bool) -> None:
+    def _capture_loop(self, device_path: str, is_touch: bool,
+                      slot: int) -> None:
         import evdev
         import msgpack
         try:
@@ -420,7 +421,11 @@ class InputForwarder:
                     state['p'] = 1.0 if state['tip'] else 0.0
                 now = time.time()
                 if now - last >= interval:
-                    pkt = msgpack.packb({'t': now, **state}, use_bin_type=True)
+                    # 'slot' keeps this device's contact independent of the
+                    # other digitizer's on the host — otherwise the idle
+                    # device's tip=False cancels the active one's tip=True.
+                    pkt = msgpack.packb({'t': now, 'slot': slot, **state},
+                                        use_bin_type=True)
                     sock.sendto(pkt, (self.host, self.input_port))
                     last = now
             except OSError as e:
@@ -437,9 +442,9 @@ class InputForwarder:
         if not devices:
             return False
         self._running = True
-        for path, _name, is_touch in devices:
+        for slot, (path, _name, is_touch) in enumerate(devices):
             t = threading.Thread(target=self._capture_loop,
-                                 args=(path, is_touch), daemon=True)
+                                 args=(path, is_touch, slot), daemon=True)
             t.start()
             self._threads.append(t)
         return True
