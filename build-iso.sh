@@ -234,15 +234,18 @@ chmod +x "${CHROOT_DIR}/usr/local/bin/sp7-receiver.py"
 chmod +x "${CHROOT_DIR}/usr/local/bin/sp7-input-client.py"
 chmod +x "${CHROOT_DIR}/usr/local/bin/sp7-monitor"
 
-# Copy overlay files
-rsync -a "${OVERLAY_DIR}/" "${CHROOT_DIR}/"
+# Copy overlay files. --chown=root:root is essential: the overlay tree is
+# checked out as a normal user, and a plain `rsync -a` would preserve that
+# uid/gid inside the image — which makes sshd reject authorized_keys and
+# NetworkManager reject connection keyfiles (both require root ownership).
+rsync -a --chown=root:root "${OVERLAY_DIR}/" "${CHROOT_DIR}/"
 
 # Copy local overlay if present (git-ignored: Wi-Fi credentials, SSH keys).
 # See overlay-local/ — kept out of version control so secrets never reach
 # the public repository, but baked into the ISO at build time.
 if [ -d "${SCRIPT_DIR}/overlay-local" ]; then
     info "Applying local overlay (network configs, SSH keys)..."
-    rsync -a "${SCRIPT_DIR}/overlay-local/" "${CHROOT_DIR}/"
+    rsync -a --chown=root:root "${SCRIPT_DIR}/overlay-local/" "${CHROOT_DIR}/"
 fi
 
 # Enable services: receiver, NetworkManager (Wi-Fi auto-connect), SSH server

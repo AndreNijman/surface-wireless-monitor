@@ -422,6 +422,7 @@ onward each change is a git commit.
 | **v11** | Unmount the chroot's `/proc`, `/sys`, `/dev`, `/run` bind mounts before `mksquashfs`. Otherwise `mksquashfs` descended into the mounted `/proc` and tried to archive `/proc/kcore` — a virtual file the size of the machine's address space — producing a runaway squashfs that filled the disk and never completed. |
 | **v12** | Removed `efi_net` from the EFI `grub-mkimage` module list. It is the EFI network-boot module and is not shipped by Void's `grub-x86_64-efi` package, so `grub-mkimage` aborted. It is irrelevant to USB boot. |
 | **v13** | Install up-to-date `iwlwifi` firmware. Debian bookworm's `firmware-iwlwifi` stops at `iwlwifi-cc-a0-72`, but the linux-surface kernel's driver needs `iwlwifi-cc-a0-77` for the Surface Pro 7's Intel AX201 — without it Wi-Fi failed at boot with "no suitable firmware found" and no `wlan` device. The build now fetches and installs the current `firmware-iwlwifi` package from the Debian pool. |
+| **v14** | `rsync --chown=root:root` for the overlay copy. A plain `rsync -a` preserves the build user's uid/gid inside the image, which made `sshd` reject `authorized_keys` and NetworkManager reject the Wi-Fi keyfiles — both require root ownership. Also a round of receiver/service/host-streamer fixes so the wireless-monitor stack actually runs (see git history). |
 
 ---
 
