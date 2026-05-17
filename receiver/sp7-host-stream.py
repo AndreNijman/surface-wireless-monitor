@@ -6,20 +6,26 @@ Runs on the host PC. Captures the desktop, encodes it to H.264, and
 streams it as RTP/UDP to the Surface Pro 7 receiver. Also receives
 pen/touch input from the Surface and injects it locally via uinput.
 
+Extended display vs mirror
+--------------------------
+By default (Hyprland) the host creates a *headless virtual output* at the
+Surface's 3:2 resolution: the Surface becomes a real second monitor with
+its own desktop. Pass --mirror to instead duplicate an existing screen.
+
 Capture sources
 ---------------
-* X11 sessions: `ximagesrc` works directly.
-* Wayland sessions (Hyprland/sway/...): X11 capture sees only a black
-  XWayland root. Use --source with a PipeWire screencast portal source
-  (see receiver/portal_screencast.py), or --source "videotestsrc is-live=true"
-  for a test pattern.
+* X11 sessions: `ximagesrc` works directly (mirror only).
+* Wayland sessions (Hyprland): the virtual output — or, with --mirror, an
+  existing output — is captured via wf-recorder (wlr-screencopy).
 
-Usage: sp7-host-stream.py --target <SP7_IP> [--source GST_SRC] [--fps N]
-                          [--bitrate KBPS] [--no-input] [--verbose]
+Usage: sp7-host-stream.py [--target <SP7_IP>] [--mirror] [--display WxH]
+                          [--fps N] [--bitrate KBPS] [--width W]
+                          [--no-input] [--verbose]
 """
 
 import os
 import sys
+import json
 import time
 import socket
 import signal
@@ -53,6 +59,14 @@ DEFAULT_FPS = 30
 # 8 Mbps: 12 Mbps saturated typical 2.4/5GHz Wi-Fi, causing bursty packet
 # loss (H.264 macroblock glitches). 8 Mbps leaves headroom for the link.
 DEFAULT_BITRATE = 8000  # kbps
+
+# Virtual extended-display defaults — the Surface Pro 7 panel (3:2).
+DEFAULT_DISPLAY_W = 2736
+DEFAULT_DISPLAY_H = 1824
+
+# uinput touch device name, and the slug Hyprland derives from it.
+TOUCH_DEVICE_NAME = 'SP7 Virtual Touchscreen'
+TOUCH_DEVICE_HYPR = 'sp7-virtual-touchscreen'
 
 
 def discover_surface(timeout: float = 6.0) -> Optional[str]:
@@ -168,18 +182,24 @@ class WfRecorderCapture:
     exposed to GStreamer as an `fdsrc`. Raw frames (single hardware encode
     downstream); -D forces continuous frames regardless of screen damage."""
 
-    def __init__(self):
+    def __init__(self, output: Optional[str] = None):
+        self.output = output   # specific output to capture; None = first
         self.proc = None
         self.fifo = None
         self.fd = None
 
     def start(self) -> str:
-        import json
         import tempfile
         mons = json.loads(subprocess.run(
             ['hyprctl', '-j', 'monitors'],
             capture_output=True, text=True, timeout=5).stdout)
-        m = mons[0]
+        if self.output:
+            m = next((x for x in mons if x['name'] == self.output), None)
+            if m is None:
+                raise RuntimeError(f"capture output '{self.output}' not "
+                                   f"found among Hyprland monitors")
+        else:
+            m = mons[0]
         out, w, h = m['name'], int(m['width']), int(m['height'])
         rate = max(1, round(float(m.get('refreshRate', 60))))
         self.fifo = tempfile.mktemp(prefix='sp7cap-', suffix='.y4m')
@@ -317,7 +337,7 @@ class InputServer:
             ],
         }
         try:
-            self._uinput = UInput(cap, name='SP7 Virtual Touchscreen',
+            self._uinput = UInput(cap, name=TOUCH_DEVICE_NAME,
                                   input_props=[e.INPUT_PROP_DIRECT],
                                   version=0x3)
         except PermissionError:
@@ -475,11 +495,85 @@ class DiscoveryBeacon:
 
 
 # ---------------------------------------------------------------------------
+# Virtual extended display (Hyprland headless output)
+# ---------------------------------------------------------------------------
+class VirtualDisplay:
+    """Creates a Hyprland headless output so the Surface acts as a real
+    *extended* monitor — its own 3:2 desktop you can drag windows onto —
+    rather than mirroring an existing screen."""
+
+    def __init__(self, width: int, height: int, refresh: int = 60):
+        self.width = width
+        self.height = height
+        self.refresh = refresh
+        self.name: Optional[str] = None
+        self._created = False
+
+    @staticmethod
+    def _hyprctl(*args) -> subprocess.CompletedProcess:
+        return subprocess.run(['hyprctl', *args], capture_output=True,
+                               text=True, timeout=8)
+
+    @classmethod
+    def _headless_outputs(cls) -> list:
+        try:
+            mons = json.loads(cls._hyprctl('-j', 'monitors').stdout)
+            return sorted(m['name'] for m in mons
+                          if m['name'].startswith('HEADLESS-'))
+        except Exception:
+            return []
+
+    def create(self) -> str:
+        """Create (or reuse) the headless output and size it. Returns its
+        name. Raises if Hyprland is not driving the session."""
+        if self._hyprctl('version').returncode != 0:
+            raise RuntimeError("hyprctl unavailable (not a Hyprland session)")
+        existing = self._headless_outputs()
+        if existing:
+            # Reuse a headless output left over from an unclean exit rather
+            # than stacking phantom monitors.
+            self.name = existing[0]
+            self._created = False
+            logger.info(f"Reusing headless output {self.name}")
+        else:
+            self._hyprctl('output', 'create', 'headless')
+            time.sleep(0.6)
+            new = self._headless_outputs()
+            if not new:
+                raise RuntimeError("Hyprland did not create a headless output")
+            self.name = new[0]
+            self._created = True
+        self._hyprctl('keyword', 'monitor',
+                      f'{self.name},{self.width}x{self.height}@'
+                      f'{self.refresh},auto,1')
+        time.sleep(0.4)
+        logger.info(f"Virtual display: {self.name} "
+                    f"{self.width}x{self.height} (extended desktop)")
+        return self.name
+
+    def bind_touch(self, hypr_device_name: str) -> None:
+        """Route the named touch device's input onto this display, so a
+        touch maps to the virtual desktop and not an existing screen."""
+        r = self._hyprctl('keyword',
+                           f'device[{hypr_device_name}]:output', self.name)
+        if r.returncode == 0 and 'ok' in r.stdout.lower():
+            logger.info(f"Touch input bound to {self.name}")
+        else:
+            logger.warning("Could not bind touch input to "
+                            f"{self.name}: {r.stdout.strip() or r.stderr.strip()}")
+
+    def destroy(self) -> None:
+        if self.name and self._created:
+            self._hyprctl('output', 'remove', self.name)
+            logger.info(f"Virtual display {self.name} removed")
+
+
+# ---------------------------------------------------------------------------
 # Host server
 # ---------------------------------------------------------------------------
 class HostServer:
     def __init__(self, target_ip, video_port, input_port, source,
-                 fps, bitrate, enable_input, width=0):
+                 fps, bitrate, enable_input, width=0, virtual_display=None):
         self.target_ip = target_ip
         self.video_port = video_port
         self.input_port = input_port
@@ -488,6 +582,7 @@ class HostServer:
         self.bitrate = bitrate
         self.enable_input = enable_input
         self.width = width
+        self.virtual_display = virtual_display
         self.streamer = None
         self.input_server = None
         self.advertiser = None
@@ -510,6 +605,11 @@ class HostServer:
         if self.enable_input:
             self.input_server = InputServer(self.input_port)
             self.input_server.start()
+            # Route touch onto the virtual display once Hyprland has
+            # registered the hotplugged uinput device.
+            if self.virtual_display and self.input_server._uinput:
+                time.sleep(1.2)
+                self.virtual_display.bind_touch(TOUCH_DEVICE_HYPR)
         self.streamer = VideoStreamer(self.target_ip, self.video_port,
                                       self.source, self.fps, self.bitrate,
                                       self.width)
@@ -529,6 +629,8 @@ class HostServer:
             self.advertiser.stop()
         if self.capture:
             self.capture.stop()
+        if self.virtual_display:
+            self.virtual_display.destroy()
 
     def run(self):
         try:
@@ -559,6 +661,13 @@ def main():
                         help='downscale capture to this width before '
                              'encoding (even number; 0 = native, default). '
                              'Lower it if Wi-Fi cannot keep up.')
+    parser.add_argument('--mirror', action='store_true',
+                        help='mirror an existing screen instead of creating '
+                             'a separate extended display for the Surface')
+    parser.add_argument('--display',
+                        default=f'{DEFAULT_DISPLAY_W}x{DEFAULT_DISPLAY_H}',
+                        help='virtual extended-display resolution WxH '
+                             '(default: %(default)s, the Surface panel)')
     parser.add_argument('--no-input', action='store_true',
                         help='Disable pen/touch input reception')
     parser.add_argument('--verbose', '-v', action='store_true')
@@ -577,17 +686,38 @@ def main():
         logger.info(f"Found Surface at {target}")
 
     Gst.init(None)
-    source = args.source or detect_capture_source()
+
+    # By default create a headless virtual output so the Surface is a
+    # genuine *extended* monitor with its own desktop. --mirror duplicates
+    # an existing screen instead; an explicit --source also skips this.
+    virtual_display = None
+    capture_output = None
+    if not args.mirror and not args.source:
+        try:
+            dw, dh = (int(v) for v in args.display.lower().split('x'))
+            virtual_display = VirtualDisplay(dw, dh)
+            capture_output = virtual_display.create()
+        except Exception as e:
+            logger.error(f"Virtual display unavailable ({e}) — "
+                         f"mirroring the primary screen instead")
+            virtual_display = None
+            capture_output = None
+
+    source = 'wfrecorder' if virtual_display \
+        else (args.source or detect_capture_source())
     capture = None
     if source == 'wfrecorder':
         try:
-            capture = WfRecorderCapture()
+            capture = WfRecorderCapture(output=capture_output)
             source = capture.start()
             logger.info(f"Capture source: {source}")
         except Exception as e:
             logger.error(f"wf-recorder capture failed: {e}")
             logger.error("Falling back to a test pattern (pass --source to override)")
             source = 'videotestsrc is-live=true pattern=ball'
+            if virtual_display:
+                virtual_display.destroy()
+                virtual_display = None
     elif source == 'portal':
         logger.info("Opening Wayland desktop capture via xdg-desktop-portal...")
         try:
@@ -603,7 +733,7 @@ def main():
 
     server = HostServer(target, args.video_port, args.input_port,
                         source, args.fps, args.bitrate, not args.no_input,
-                        args.width)
+                        args.width, virtual_display)
     server.capture = capture
     signal.signal(signal.SIGINT, lambda *_: server.stop())
     signal.signal(signal.SIGTERM, lambda *_: server.stop())
