@@ -48,8 +48,34 @@ logger = logging.getLogger('sp7-host')
 
 DEFAULT_VIDEO_PORT = 5004
 DEFAULT_INPUT_PORT = 5005
+DISCOVERY_PORT = 5006
 DEFAULT_FPS = 30
 DEFAULT_BITRATE = 12000  # kbps
+
+
+def discover_surface(timeout: float = 6.0) -> Optional[str]:
+    """Broadcast a UDP discovery probe and return the Surface's IP address
+    (the receiver's DiscoveryResponder answers it), or None if not found."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    s.settimeout(1.0)
+    logger.info("Discovering the Surface on the LAN...")
+    deadline = time.time() + timeout
+    try:
+        while time.time() < deadline:
+            try:
+                s.sendto(b'SP7?', ('255.255.255.255', DISCOVERY_PORT))
+            except OSError as e:
+                logger.debug(f"broadcast send failed: {e}")
+            try:
+                data, addr = s.recvfrom(256)
+                if b'SP7-MONITOR' in data:
+                    return addr[0]
+            except socket.timeout:
+                continue
+    finally:
+        s.close()
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -89,19 +115,22 @@ def build_capture_pipeline(source: str, fps: int, bitrate: int,
         encstr = (f'x264enc bitrate={bitrate} speed-preset=ultrafast '
                   f'tune=zerolatency key-int-max={fps * 2}')
     elif enc == 'vaapih264enc':
-        encstr = f'vaapih264enc rate-control=cbr bitrate={bitrate}'
+        encstr = (f'vaapih264enc rate-control=cbr bitrate={bitrate} '
+                  f'keyframe-period={fps}')
     elif enc == 'vah264enc':
-        encstr = f'vah264enc bitrate={bitrate}'
+        encstr = f'vah264enc bitrate={bitrate} key-int-max={fps} ref-frames=1'
     elif enc == 'nvh264enc':
         encstr = f'nvh264enc bitrate={bitrate} gop-size={fps * 2} bframes=0'
     else:
         encstr = enc
 
+    # No videorate: it stalls on wf-recorder's y4m output (the avformat
+    # timebase confuses rate negotiation). The desktop is streamed at its
+    # native refresh rate, which is what a monitor wants anyway.
     # No pinned pixel format: videoconvert negotiates whatever the chosen
     # encoder accepts (I420 for x264enc, NV12 for the VA-API encoders).
     pipeline = (
-        f"{source} ! videorate ! video/x-raw,framerate={fps}/1 ! "
-        f"videoconvert ! videoscale ! {encstr} ! "
+        f"{source} ! videoconvert ! videoscale ! {encstr} ! "
         f"h264parse config-interval=1 ! "
         f"rtph264pay pt=96 mtu=1400 config-interval=1 ! "
         f"udpsink host={target_ip} port={target_port} sync=false"
@@ -432,8 +461,9 @@ class HostServer:
 
 def main():
     parser = argparse.ArgumentParser(description='SP7 Monitor Host Streamer')
-    parser.add_argument('--target', '-t', required=True,
-                        help='Surface Pro 7 receiver IP address')
+    parser.add_argument('--target', '-t',
+                        help='Surface Pro 7 IP address '
+                             '(auto-discovered on the LAN if omitted)')
     parser.add_argument('--video-port', type=int, default=DEFAULT_VIDEO_PORT)
     parser.add_argument('--input-port', type=int, default=DEFAULT_INPUT_PORT)
     parser.add_argument('--source', '-s',
@@ -450,6 +480,15 @@ def main():
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
+
+    target = args.target
+    if not target:
+        target = discover_surface()
+        if not target:
+            logger.error("No Surface found on the LAN. Boot it and wait for "
+                          "Wi-Fi to connect, or pass --target <ip>.")
+            sys.exit(1)
+        logger.info(f"Found Surface at {target}")
 
     Gst.init(None)
     source = args.source or detect_capture_source()
@@ -476,7 +515,7 @@ def main():
             logger.error("Falling back to a test pattern (pass --source to override)")
             source = 'videotestsrc is-live=true pattern=ball'
 
-    server = HostServer(args.target, args.video_port, args.input_port,
+    server = HostServer(target, args.video_port, args.input_port,
                         source, args.fps, args.bitrate, not args.no_input)
     server.capture = capture
     signal.signal(signal.SIGINT, lambda *_: server.stop())

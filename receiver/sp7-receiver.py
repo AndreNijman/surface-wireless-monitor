@@ -54,6 +54,7 @@ SP7_HEIGHT = 1824
 
 DEFAULT_VIDEO_PORT = 5004
 DEFAULT_INPUT_PORT = 5005
+DISCOVERY_PORT = 5006
 CONFIG_PATH = "/etc/sp7-monitor/config.conf"
 
 RTP_CAPS = ('application/x-rtp,media=video,encoding-name=H264,'
@@ -165,13 +166,16 @@ class VideoReceiver:
 
     @staticmethod
     def _pick_decoder() -> str:
-        """Choose the best available H.264 decoder element."""
-        for dec in ('vah264dec', 'vaapih264dec'):
-            if Gst.ElementFactory.find(dec):
-                logger.info(f"Using hardware H.264 decoder: {dec}")
-                return f"{dec} ! "
-        logger.warning("No VA-API decoder found — using software avdec_h264")
-        return "avdec_h264 max-threads=4 ! "
+        """H.264 decoder. Software avdec_h264 is the default: it is reliable
+        and decodes straight to system-memory video/x-raw. The VA-API
+        decoders (vah264dec) on the SP7's Gen11 iGPU fail caps negotiation
+        into a non-VA sink ('not-negotiated'); software decode of 720p/1080p
+        is cheap on the Surface's i5, so it is not worth the fragility."""
+        if Gst.ElementFactory.find('avdec_h264'):
+            logger.info("Using software H.264 decoder: avdec_h264")
+            return "avdec_h264 max-threads=4 ! "
+        logger.warning("avdec_h264 not found — falling back to vah264dec")
+        return "vah264dec ! "
 
     @staticmethod
     def _pick_sink() -> str:
@@ -184,10 +188,16 @@ class VideoReceiver:
     def _build_pipeline(self) -> Gst.Pipeline:
         desc = (
             f'udpsrc port={self.video_port} caps="{RTP_CAPS}" ! '
-            'rtpjitterbuffer latency=30 drop-on-latency=true ! '
+            # 200ms jitterbuffer — forgiving of Wi-Fi jitter (a monitor can
+            # afford the latency; an aggressive buffer just drops frames).
+            'rtpjitterbuffer latency=200 ! '
             'rtph264depay ! h264parse ! '
             + self._pick_decoder() +
-            'videoconvert ! videoscale ! '
+            # Force system-memory raw: the VA-API decoder (vah264dec) emits
+            # VAMemory frames that plain videoconvert cannot accept, which
+            # fails the pipeline with 'not-negotiated'. This capsfilter makes
+            # the decoder download to system memory first.
+            'video/x-raw ! videoconvert ! videoscale ! '
             f'video/x-raw,width={self.width},height={self.height} ! '
             + self._pick_sink()
         )
@@ -399,6 +409,58 @@ class InputForwarder:
 
 
 # ---------------------------------------------------------------------------
+# Discovery responder — lets the host streamer find this Surface
+# ---------------------------------------------------------------------------
+class DiscoveryResponder:
+    """Listens for host discovery broadcasts on UDP :DISCOVERY_PORT. On a
+    probe it replies (so the host learns this Surface's address) and reports
+    the host's address back to the receiver for input forwarding."""
+
+    PROBE = b'SP7?'
+    REPLY = b'SP7-MONITOR'
+
+    def __init__(self, port: int, on_host):
+        self.port = port
+        self.on_host = on_host
+        self._running = False
+        self._sock: Optional[socket.socket] = None
+
+    def start(self) -> None:
+        self._running = True
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self) -> None:
+        try:
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._sock.bind(('0.0.0.0', self.port))
+            self._sock.settimeout(1.0)
+        except Exception as e:
+            logger.error(f"Discovery responder bind failed: {e}")
+            return
+        logger.info(f"Discovery responder listening on UDP :{self.port}")
+        while self._running:
+            try:
+                data, addr = self._sock.recvfrom(256)
+                if data.strip() == self.PROBE:
+                    self._sock.sendto(self.REPLY, addr)
+                    self.on_host(addr[0])
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if self._running:
+                    logger.debug(f"discovery: {e}")
+
+    def stop(self) -> None:
+        self._running = False
+        if self._sock:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
 # Main receiver
 # ---------------------------------------------------------------------------
 class SP7Receiver:
@@ -410,31 +472,53 @@ class SP7Receiver:
         self.enable_input = enable_input
         self.video: Optional[VideoReceiver] = None
         self.input_fwd: Optional[InputForwarder] = None
+        self.disc: Optional[DiscoveryResponder] = None
         self._shutdown = threading.Event()
 
     def start(self) -> None:
         logger.info("=" * 52)
         logger.info("  SP7 Wireless Monitor Receiver")
         logger.info(f"  video :{self.video_port}  input :{self.input_port}  "
-                    f"host: {self.host or '(none — video only)'}")
+                    f"host: {self.host or '(awaiting discovery)'}")
         logger.info("=" * 52)
 
         # Video always starts — it just listens on a UDP port.
         self.video = VideoReceiver(self.video_port, SP7_WIDTH, SP7_HEIGHT)
         self.video.start()
 
-        # Input forwarding needs a host to send to.
-        if self.enable_input and self.host:
-            self.input_fwd = InputForwarder(self.host, self.input_port)
-            if not self.input_fwd.start():
-                logger.warning("Input forwarding could not start")
-        elif not self.host:
-            logger.info("Input forwarding idle — no host set. Add 'host=<ip>' "
-                        "to /etc/sp7-monitor/config.conf and restart.")
+        # Answer host discovery broadcasts; the host streamer finds us this
+        # way, and we learn its address for input forwarding.
+        self.disc = DiscoveryResponder(DISCOVERY_PORT, self._on_host)
+        self.disc.start()
+
+        if self.host:
+            self._start_input(self.host)
+        else:
+            logger.info("Awaiting host discovery for input forwarding "
+                        "(or set 'host=' in /etc/sp7-monitor/config.conf)")
+
+    def _start_input(self, host_ip: str) -> None:
+        """(Re)start input forwarding aimed at host_ip."""
+        if not self.enable_input:
+            return
+        if self.input_fwd:
+            self.input_fwd.stop()
+        self.host = host_ip
+        self.input_fwd = InputForwarder(host_ip, self.input_port)
+        if not self.input_fwd.start():
+            logger.warning("Input forwarding could not start")
+
+    def _on_host(self, host_ip: str) -> None:
+        """A host streamer announced itself via discovery."""
+        if host_ip != self.host:
+            logger.info(f"Host discovered: {host_ip} — forwarding input there")
+            self._start_input(host_ip)
 
     def stop(self) -> None:
         logger.info("Shutting down receiver...")
         self._shutdown.set()
+        if self.disc:
+            self.disc.stop()
         if self.input_fwd:
             self.input_fwd.stop()
         if self.video:
