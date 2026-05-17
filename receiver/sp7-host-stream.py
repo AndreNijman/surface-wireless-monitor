@@ -60,9 +60,11 @@ DEFAULT_FPS = 30
 # loss (H.264 macroblock glitches). 8 Mbps leaves headroom for the link.
 DEFAULT_BITRATE = 8000  # kbps
 
-# Virtual extended-display defaults — the Surface Pro 7 panel (3:2).
-DEFAULT_DISPLAY_W = 2736
-DEFAULT_DISPLAY_H = 1824
+# Virtual extended-display defaults —1080p at the Surface's 3:2 aspect
+# (1620x1080). The receiver hardware-upscales it to the 2736x1824 panel;
+# both are 3:2, so it fills the screen with no distortion or black bars.
+DEFAULT_DISPLAY_W = 1620
+DEFAULT_DISPLAY_H = 1080
 
 # uinput touch device name, and the slug Hyprland derives from it.
 TOUCH_DEVICE_NAME = 'SP7 Virtual Touchscreen'
