@@ -10,3 +10,7 @@ build/
 # Local secrets overlay — Wi-Fi credentials, SSH keys.
 # Baked into the ISO at build time; never committed (this repo is public).
 overlay-local/
+
+# Python bytecode
+__pycache__/
+*.pyc
