@@ -71,10 +71,8 @@ def detect_capture_source() -> str:
     """Best-effort default capture source. --source overrides this."""
     session = os.environ.get('XDG_SESSION_TYPE', '')
     if session == 'wayland':
-        logger.warning("Wayland session: X11 capture would be blank. "
-                        "Pass --source with a PipeWire portal source "
-                        "(see portal_screencast.py). Using a test pattern.")
-        return 'videotestsrc is-live=true pattern=ball'
+        logger.info("Wayland session — capturing via xdg-desktop-portal")
+        return 'portal'
     if _have('ximagesrc'):
         disp = os.environ.get('DISPLAY', ':0')
         logger.info(f"X11 capture via ximagesrc (display {disp})")
@@ -391,6 +389,18 @@ def main():
 
     Gst.init(None)
     source = args.source or detect_capture_source()
+    if source == 'portal':
+        logger.info("Opening Wayland desktop capture via xdg-desktop-portal...")
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            import portal_screencast
+            fd, node = portal_screencast.open_screencast()
+            source = portal_screencast.gst_source(fd, node)
+            logger.info(f"Screencast source: {source}")
+        except Exception as e:
+            logger.error(f"Portal screencast failed: {e}")
+            logger.error("Falling back to a test pattern (pass --source to override)")
+            source = 'videotestsrc is-live=true pattern=ball'
 
     server = HostServer(args.target, args.video_port, args.input_port,
                         source, args.fps, args.bitrate, not args.no_input)
