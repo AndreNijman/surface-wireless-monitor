@@ -247,6 +247,21 @@ is not yet packaged in this repository — track it as future work.
 python3 receiver/sp7-host-stream.py --target <SURFACE_IP> --verbose
 ```
 
+The streamer auto-detects how to capture the screen:
+
+- **X11 host** → `ximagesrc` (automatic, no extra setup).
+- **Wayland host** (Hyprland/wlroots) → `wf-recorder` over `wlr-screencopy`.
+  Install it: `sudo xbps-install -Sy wf-recorder` (Void) or your distro's
+  equivalent. This is the reliable Wayland path and the default.
+- Override with `--source`:
+  - `--source "videotestsrc is-live=true"` — a test pattern (no real capture).
+  - `--source portal` — capture via the `xdg-desktop-portal` ScreenCast API
+    (needs a working ScreenCast backend, e.g. `xdg-desktop-portal-hyprland`;
+    see `receiver/portal_screencast.py`).
+  - `--source "<any GStreamer source fragment>"` — full manual control.
+
+Other options: `--fps`, `--bitrate` (kbps), `--no-input`, `--input-port`.
+
 ---
 
 ## Part 5 — Connect
@@ -423,6 +438,7 @@ onward each change is a git commit.
 | **v12** | Removed `efi_net` from the EFI `grub-mkimage` module list. It is the EFI network-boot module and is not shipped by Void's `grub-x86_64-efi` package, so `grub-mkimage` aborted. It is irrelevant to USB boot. |
 | **v13** | Install up-to-date `iwlwifi` firmware. Debian bookworm's `firmware-iwlwifi` stops at `iwlwifi-cc-a0-72`, but the linux-surface kernel's driver needs `iwlwifi-cc-a0-77` for the Surface Pro 7's Intel AX201 — without it Wi-Fi failed at boot with "no suitable firmware found" and no `wlan` device. The build now fetches and installs the current `firmware-iwlwifi` package from the Debian pool. |
 | **v14** | `rsync --chown=root:root` for the overlay copy. A plain `rsync -a` preserves the build user's uid/gid inside the image, which made `sshd` reject `authorized_keys` and NetworkManager reject the Wi-Fi keyfiles — both require root ownership. Also a round of receiver/service/host-streamer fixes so the wireless-monitor stack actually runs (see git history). |
+| **v15** | Wireless-monitor stack made functional end-to-end (receiver rework, service fixes, host streamer rework) and real Wayland desktop capture added (`wf-recorder` over `wlr-screencopy`, plus a working `xdg-desktop-portal` path in `portal_screencast.py`). This is software in `receiver/`, not the build script — see the git history from this point on. |
 
 ---
 
