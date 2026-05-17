@@ -424,6 +424,46 @@ class ServiceAdvertiser:
 
 
 # ---------------------------------------------------------------------------
+# Discovery beacon
+# ---------------------------------------------------------------------------
+class DiscoveryBeacon:
+    """Periodically broadcasts the discovery probe. The one-shot sweep in
+    discover_surface() only runs at host startup; if the Surface receiver
+    restarts after that, it would never learn this host's address (and so
+    never forward input back). This keeps broadcasting so the receiver's
+    DiscoveryResponder always re-learns the host within a few seconds."""
+
+    def __init__(self, port: int, interval: float = 3.0):
+        self.port = port
+        self.interval = interval
+        self._running = False
+        self._sock: Optional[socket.socket] = None
+
+    def start(self):
+        self._running = True
+        threading.Thread(target=self._loop, daemon=True).start()
+        logger.info(f"Discovery beacon broadcasting every {self.interval}s")
+
+    def _loop(self):
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        while self._running:
+            try:
+                self._sock.sendto(b'SP7?', ('255.255.255.255', self.port))
+            except OSError as e:
+                logger.debug(f"beacon broadcast failed: {e}")
+            time.sleep(self.interval)
+
+    def stop(self):
+        self._running = False
+        if self._sock:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
 # Host server
 # ---------------------------------------------------------------------------
 class HostServer:
@@ -440,6 +480,7 @@ class HostServer:
         self.streamer = None
         self.input_server = None
         self.advertiser = None
+        self.beacon = None
         self.capture = None
         self._stop = threading.Event()
 
@@ -451,6 +492,10 @@ class HostServer:
         logger.info("=" * 52)
         self.advertiser = ServiceAdvertiser(self.video_port)
         self.advertiser.start()
+        # Keep announcing ourselves so the Surface can (re)discover us and
+        # forward input back, even if its receiver restarts.
+        self.beacon = DiscoveryBeacon(DISCOVERY_PORT)
+        self.beacon.start()
         if self.enable_input:
             self.input_server = InputServer(self.input_port)
             self.input_server.start()
@@ -467,6 +512,8 @@ class HostServer:
             self.streamer.stop()
         if self.input_server:
             self.input_server.stop()
+        if self.beacon:
+            self.beacon.stop()
         if self.advertiser:
             self.advertiser.stop()
         if self.capture:

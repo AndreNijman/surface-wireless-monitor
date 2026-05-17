@@ -295,7 +295,11 @@ class VideoReceiver:
 # Input forwarder (evdev capture -> network)
 # ---------------------------------------------------------------------------
 class InputForwarder:
-    """Captures the Surface digitizer and forwards events to the host."""
+    """Captures the Surface digitizer(s) and forwards events to the host.
+
+    The Surface exposes the pen and finger-touch as *separate* evdev
+    devices (IPTSD Virtual Stylus and IPTSD Virtual Touchscreen). Both are
+    captured — one thread each — so finger touch works, not just the pen."""
 
     SEND_HZ = 120
 
@@ -303,16 +307,19 @@ class InputForwarder:
         self.host = host
         self.input_port = input_port
         self._running = False
-        self._thread: Optional[threading.Thread] = None
-        self._socket: Optional[socket.socket] = None
+        self._threads: list = []
+        self._sockets: list = []
 
     @staticmethod
-    def _find_input_device() -> Optional[str]:
+    def _find_input_devices() -> list:
+        """Return [(path, name, is_touch), ...] for every usable digitizer:
+        the cooked iptsd virtual pen and touchscreen. The raw 'Intel Touch
+        Host Controller' nodes are skipped (score 1)."""
         try:
             import evdev
         except ImportError:
             logger.error("python-evdev not installed — input disabled")
-            return None
+            return []
         candidates = []
         for path in evdev.list_devices():
             try:
@@ -324,10 +331,8 @@ class InputForwarder:
                 if (evdev.ecodes.ABS_X in abs_codes
                         and evdev.ecodes.ABS_Y in abs_codes):
                     name = dev.name.lower()
-                    # Prefer the cooked iptsd virtual *pen*; the raw
-                    # "Intel Touch Host Controller" is not what we want.
                     if 'host controller' in name:
-                        score = 1
+                        score = 1          # raw node — skip
                     elif 'stylus' in name or 'pen' in name:
                         score = 4
                     elif 'iptsd' in name or 'touchscreen' in name:
@@ -337,27 +342,33 @@ class InputForwarder:
                         score = 2
                     else:
                         score = 0
-                    candidates.append((score, path, dev.name))
+                    is_touch = ('touch' in name
+                                and 'stylus' not in name
+                                and 'pen' not in name)
+                    candidates.append((score, path, dev.name, is_touch))
             except (PermissionError, OSError):
                 continue
-        if not candidates:
+        # Capture every cooked digitizer (score >= 2): pen and touchscreen.
+        useful = [(p, n, t) for s, p, n, t in candidates if s >= 2]
+        if not useful:
             logger.warning("No digitizer / touch device found")
-            return None
-        candidates.sort(reverse=True)
-        _, path, name = candidates[0]
-        logger.info(f"Input device: {name} ({path})")
-        return path
+        for p, n, t in useful:
+            logger.info(f"Input device: {n} ({p}) "
+                        f"[{'touch' if t else 'pen'}]")
+        return useful
 
-    def _capture_loop(self, device_path: str) -> None:
+    def _capture_loop(self, device_path: str, is_touch: bool) -> None:
         import evdev
         import msgpack
         try:
             device = evdev.InputDevice(device_path)
         except Exception as e:
-            logger.error(f"Cannot open input device: {e}")
+            logger.error(f"Cannot open input device {device_path}: {e}")
             return
-        self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        logger.info(f"Forwarding input to {self.host}:{self.input_port}")
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sockets.append(sock)
+        logger.info(f"Forwarding {'touch' if is_touch else 'pen'} input "
+                    f"to {self.host}:{self.input_port}")
 
         absinfo = {}
         for code, info in device.capabilities().get(evdev.ecodes.EV_ABS, []):
@@ -400,10 +411,17 @@ class InputForwarder:
                             state['rng'] = bool(ev.value)
                         elif ev.code == evdev.ecodes.BTN_STYLUS:
                             state['btn'] = 1 if ev.value else 0
+                # The touchscreen has no pressure and no BTN_TOOL_PEN. The
+                # host's virtual device is a pen tool, which only registers
+                # while "in proximity": map a finger contact to proximity +
+                # full pressure so taps land as clicks.
+                if is_touch:
+                    state['rng'] = state['tip']
+                    state['p'] = 1.0 if state['tip'] else 0.0
                 now = time.time()
                 if now - last >= interval:
                     pkt = msgpack.packb({'t': now, **state}, use_bin_type=True)
-                    self._socket.sendto(pkt, (self.host, self.input_port))
+                    sock.sendto(pkt, (self.host, self.input_port))
                     last = now
             except OSError as e:
                 if self._running:
@@ -412,23 +430,25 @@ class InputForwarder:
             except Exception as e:
                 logger.error(f"Input capture error: {e}")
                 time.sleep(0.1)
-        logger.info("Input forwarder stopped")
+        logger.info(f"Input forwarder stopped ({device_path})")
 
     def start(self) -> bool:
-        device_path = self._find_input_device()
-        if not device_path:
+        devices = self._find_input_devices()
+        if not devices:
             return False
         self._running = True
-        self._thread = threading.Thread(
-            target=self._capture_loop, args=(device_path,), daemon=True)
-        self._thread.start()
+        for path, _name, is_touch in devices:
+            t = threading.Thread(target=self._capture_loop,
+                                 args=(path, is_touch), daemon=True)
+            t.start()
+            self._threads.append(t)
         return True
 
     def stop(self) -> None:
         self._running = False
-        if self._socket:
+        for sock in self._sockets:
             try:
-                self._socket.close()
+                sock.close()
             except Exception:
                 pass
 
