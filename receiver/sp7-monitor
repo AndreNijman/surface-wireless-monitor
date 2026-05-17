@@ -1,0 +1,339 @@
+#!/bin/bash
+#
+# SP7 Monitor - Main Control Script
+# Manages the wireless monitor receiver lifecycle
+#
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+RECEIVER="${SCRIPT_DIR}/sp7-receiver.py"
+PIDFILE="/var/run/sp7-monitor.pid"
+LOGFILE="/var/log/sp7-monitor.log"
+CONFIG="/etc/sp7-monitor/config.conf"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+log() { echo -e "${BLUE}[SP7]${NC} $1"; }
+ok()  { echo -e "${GREEN}[OK]${NC} $1"; }
+warn(){ echo -e "${YELLOW}[WARN]${NC} $1"; }
+err() { echo -e "${RED}[ERROR]${NC} $1"; }
+
+# ---------------------------------------------------------------------------
+# Check prerequisites
+# ---------------------------------------------------------------------------
+check_prereqs() {
+    local missing=()
+
+    # Check for required tools
+    for cmd in python3 gst-launch-1.0 modprobe; do
+        if ! command -v "$cmd" &> /dev/null; then
+            missing+=("$cmd")
+        fi
+    done
+
+    # Check Python modules
+    for mod in gi msgpack evdev; do
+        if ! python3 -c "import $mod" 2>/dev/null; then
+            missing+=("python3-$mod")
+        fi
+    done
+
+    if [ ${#missing[@]} -gt 0 ]; then
+        err "Missing dependencies: ${missing[*]}"
+        log "Install with: apt-get install -y gstreamer1.0-tools python3-gst-1.0 python3-evdev python3-msgpack"
+        return 1
+    fi
+
+    # Check for surface kernel
+    if [[ ! "$(uname -r)" =~ surface ]]; then
+        warn "linux-surface kernel not detected. Touch/pen may not work."
+        warn "Current kernel: $(uname -r)"
+    else
+        ok "linux-surface kernel: $(uname -r)"
+    fi
+
+    # Check for Intel GPU
+    if lspci 2>/dev/null | grep -qi "VGA.*Intel" || [ -d /sys/class/drm/card0 ]; then
+        ok "Intel GPU detected"
+    else
+        warn "Intel GPU not detected - hardware decode may fail"
+    fi
+
+    # Check iptsd
+    if pgrep -x iptsd > /dev/null 2>&1; then
+        ok "iptsd daemon running"
+    elif command -v iptsd &> /dev/null; then
+        warn "iptsd installed but not running, starting..."
+        iptsd-run 2>/dev/null || iptsd 2>/dev/null || true
+    else
+        warn "iptsd not found - pen/touch input will not work"
+    fi
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Hardware setup
+# ---------------------------------------------------------------------------
+setup_hardware() {
+    log "Setting up Surface Pro 7 hardware..."
+
+    # Load required kernel modules
+    for mod in intel_ipts ithc surface_aggregator surface_hid; do
+        modprobe "$mod" 2>/dev/null || true
+    done
+
+    # Disable WiFi power saving for low latency
+    if command -v iw &> /dev/null; then
+        for iface in $(iw dev 2>/dev/null | grep Interface | awk '{print $2}'); do
+            iw dev "$iface" set power_save off 2>/dev/null || true
+        done
+    fi
+
+    # CPU governor for performance
+    if [ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]; then
+        echo performance > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || true
+    fi
+
+    # Disable screen blanking if X11 is available
+    if command -v xset &> /dev/null; then
+        xset s off 2>/dev/null || true
+        xset -dpms 2>/dev/null || true
+        xset s noblank 2>/dev/null || true
+    fi
+
+    # Hide cursor
+    if command -v unclutter &> /dev/null; then
+        unclutter -idle 1 -root &
+    fi
+
+    ok "Hardware setup complete"
+}
+
+# ---------------------------------------------------------------------------
+# Read configuration
+# ---------------------------------------------------------------------------
+read_config() {
+    local host=""
+    local video_port="5004"
+    local input_port="5005"
+    local extra_args=""
+
+    if [ -f "$CONFIG" ]; then
+        source "$CONFIG" 2>/dev/null || true
+    fi
+
+    # Build receiver args
+    local args=""
+    [ -n "$host" ] && args="$args --host $host"
+    [ -n "$video_port" ] && args="$args --video-port $video_port"
+    [ -n "$input_port" ] && args="$args --input-port $input_port"
+    args="$args $extra_args"
+
+    echo "$args"
+}
+
+# ---------------------------------------------------------------------------
+# Start
+# ---------------------------------------------------------------------------
+do_start() {
+    log "Starting SP7 Wireless Monitor Receiver..."
+
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+        warn "Already running (PID $(cat "$PIDFILE"))"
+        return 1
+    fi
+
+    # Run checks
+    check_prereqs || return 1
+    setup_hardware
+
+    # Determine display mode
+    export DISPLAY=:0
+    export XAUTHORITY=/home/monitor/.Xauthority
+    export GST_DEBUG=1
+    export GST_DEBUG_FILE="$LOGFILE.gst"
+
+    # Build args from config
+    local config_args
+    config_args=$(read_config)
+
+    # Start receiver
+    log "Launching receiver..."
+    if [ -t 0 ]; then
+        # Interactive - run in foreground
+        python3 "$RECEIVER" $config_args "$@" 2>&1 | tee -a "$LOGFILE"
+    else
+        # Non-interactive - background
+        nohup python3 "$RECEIVER" $config_args "$@" >> "$LOGFILE" 2>&1 &
+        local pid=$!
+        echo $pid > "$PIDFILE"
+        ok "Receiver started (PID $pid)"
+        log "Logs: $LOGFILE"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Stop
+# ---------------------------------------------------------------------------
+do_stop() {
+    log "Stopping SP7 Wireless Monitor Receiver..."
+
+    if [ -f "$PIDFILE" ]; then
+        local pid
+        pid=$(cat "$PIDFILE")
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -TERM "$pid" 2>/dev/null || true
+            sleep 2
+            kill -KILL "$pid" 2>/dev/null || true
+            ok "Stopped (PID $pid)"
+        fi
+        rm -f "$PIDFILE"
+    else
+        # Try to find and kill receiver process
+        local pids
+        pids=$(pgrep -f "sp7-receiver.py" || true)
+        if [ -n "$pids" ]; then
+            kill -TERM $pids 2>/dev/null || true
+            sleep 1
+            ok "Stopped receiver processes"
+        else
+            warn "No running receiver found"
+        fi
+    fi
+
+    # Kill unclutter
+    pkill -x unclutter 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# Status
+# ---------------------------------------------------------------------------
+do_status() {
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+        local pid
+        pid=$(cat "$PIDFILE")
+        ok "Running (PID $pid)"
+
+        if [ -f "$LOGFILE" ]; then
+            log "Recent log entries:"
+            tail -5 "$LOGFILE" 2>/dev/null | sed 's/^/  /'
+        fi
+    else
+        warn "Not running"
+    fi
+
+    # Show hardware status
+    log "Hardware status:"
+    echo "  Kernel: $(uname -r)"
+    echo "  Uptime: $(uptime -p 2>/dev/null || uptime)"
+    if command -v iw &> /dev/null; then
+        echo "  WiFi: $(iw dev 2>/dev/null | grep -E "Interface|ssid" | head -4 | sed 's/^/    /')"
+    fi
+    if [ -f /sys/class/power_supply/BAT0/capacity ]; then
+        echo "  Battery: $(cat /sys/class/power_supply/BAT0/capacity 2>/dev/null)%"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Interactive setup
+# ---------------------------------------------------------------------------
+do_setup() {
+    log "Interactive setup..."
+
+    mkdir -p "$(dirname "$CONFIG")"
+
+    echo ""
+    read -rp "Host PC IP address [auto-discover]: " host
+    read -rp "Video port [5004]: " video_port
+    read -rp "Input port [5005]: " input_port
+
+    {
+        echo "# SP7 Monitor Configuration"
+        [ -n "$host" ] && echo "host=$host" || echo "#host=192.168.1.100"
+        echo "video_port=${video_port:-5004}"
+        echo "input_port=${input_port:-5005}"
+        echo "extra_args=--verbose"
+    } > "$CONFIG"
+
+    ok "Configuration saved to $CONFIG"
+}
+
+# ---------------------------------------------------------------------------
+# Show info
+# ---------------------------------------------------------------------------
+do_info() {
+    echo ""
+    echo "========================================"
+    echo "  SP7 Wireless Monitor"
+    echo "========================================"
+    echo ""
+    echo "Version:    1.0.0"
+    echo "Kernel:     $(uname -r)"
+    echo "Display:    $(xrandr 2>/dev/null | grep '*' | head -1 | awk '{print $1}' || echo 'N/A')"
+    echo "GPU:        $(lspci 2>/dev/null | grep VGA | head -1 | cut -d: -f3 || echo 'N/A')"
+    echo "WiFi:       $(iw dev 2>/dev/null | grep Interface | head -1 | awk '{print $2}' || echo 'N/A')"
+    echo "Input devs: $(python3 -c "import evdev; print(len(evdev.list_devices()))" 2>/dev/null || echo 'N/A')"
+    echo ""
+    echo "Services:"
+    systemctl is-active sp7-monitor 2>/dev/null && echo "  sp7-monitor: active" || echo "  sp7-monitor: inactive"
+    systemctl is-active iptsd 2>/dev/null && echo "  iptsd: active" || echo "  iptsd: inactive"
+    echo ""
+    echo "Usage:"
+    echo "  sp7-monitor start [--host IP]     Start receiver"
+    echo "  sp7-monitor stop                  Stop receiver"
+    echo "  sp7-monitor status                Show status"
+    echo "  sp7-monitor setup                 Interactive config"
+    echo "  sp7-monitor info                  Show system info"
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+case "${1:-}" in
+    start)
+        shift
+        do_start "$@"
+        ;;
+    stop)
+        do_stop
+        ;;
+    restart)
+        do_stop
+        sleep 1
+        do_start
+        ;;
+    status)
+        do_status
+        ;;
+    setup)
+        do_setup
+        ;;
+    info)
+        do_info
+        ;;
+    check)
+        check_prereqs
+        ;;
+    *)
+        echo "Usage: sp7-monitor {start|stop|restart|status|setup|info|check}"
+        echo ""
+        echo "Commands:"
+        echo "  start [--host IP]  Start the wireless monitor receiver"
+        echo "  stop               Stop the receiver"
+        echo "  restart            Restart the receiver"
+        echo "  status             Show receiver status"
+        echo "  setup              Interactive configuration"
+        echo "  info               Show system information"
+        echo "  check              Check prerequisites"
+        echo ""
+        do_info
+        ;;
+esac

@@ -1,0 +1,8 @@
+# ISO build artifacts — produced by build-iso.sh at runtime
+build/
+*.iso
+*.img
+*.squashfs
+
+# Logs
+*.log

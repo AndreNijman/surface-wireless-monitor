@@ -1,0 +1,41 @@
+[Unit]
+Description=SP7 Wireless Monitor Receiver
+Documentation=https://github.com/sp7-wireless-monitor
+After=network-online.target iptsd.service systemd-user-sessions.service
+Wants=network-online.target iptsd.service
+
+[Service]
+Type=simple
+User=root
+Environment="DISPLAY=:0"
+Environment="XAUTHORITY=/home/monitor/.Xauthority"
+Environment="GST_DEBUG=1"
+Environment="GST_DEBUG_NO_COLOR=1"
+Environment="PYTHONUNBUFFERED=1"
+
+# Start the receiver
+ExecStartPre=/bin/bash -c 'modprobe intel_ipts 2>/dev/null || true; modprobe ithc 2>/dev/null || true'
+ExecStartPre=/bin/bash -c 'for i in $(iw dev 2>/dev/null | grep Interface | awk "{print \$2}"); do iw dev "$i" set power_save off 2>/dev/null || true; done'
+ExecStart=/usr/local/bin/sp7-receiver.py --verbose
+
+# Restart policy
+Restart=always
+RestartSec=3
+StartLimitInterval=30
+StartLimitBurst=5
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sp7-monitor
+
+# Security (minimal - we need hardware access)
+PrivateTmp=yes
+ProtectSystem=no
+ProtectHome=no
+DeviceAllow=/dev/input/* rw
+DeviceAllow=/dev/dri/* rw
+DeviceAllow=/dev/video* rw
+
+[Install]
+WantedBy=graphical.target

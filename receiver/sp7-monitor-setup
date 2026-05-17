@@ -1,0 +1,81 @@
+#!/bin/bash
+#
+# SP7 Monitor Initial Setup
+# Runs once on first boot to configure the system
+#
+
+set -e
+
+MARKER="/var/lib/sp7-monitor/setup-done"
+CONFIG="/etc/sp7-monitor/config.conf"
+
+info() { echo "[SP7-SETUP] $1"; }
+
+# Only run once
+if [ -f "$MARKER" ]; then
+    exit 0
+fi
+
+info "Running initial setup..."
+
+# Load kernel modules
+modprobe intel_ipts 2>/dev/null || true
+modprobe ithc 2>/dev/null || true
+modprobe surface_aggregator 2>/dev/null || true
+
+# Wait for iptsd
+for i in {1..10}; do
+    if pgrep -x iptsd > /dev/null 2>&1 || [ -e /dev/input/event* ]; then
+        info "Input devices ready"
+        break
+    fi
+    info "Waiting for input devices... ($i/10)"
+    sleep 1
+done
+
+# Find and configure WiFi
+WIFI_IFACE=""
+for iface in $(iw dev 2>/dev/null | grep Interface | awk '{print $2}'); do
+    WIFI_IFACE="$iface"
+    break
+done
+
+if [ -n "$WIFI_IFACE" ]; then
+    info "WiFi interface: $WIFI_IFACE"
+    # Disable power saving
+    iw dev "$WIFI_IFACE" set power_save off 2>/dev/null || true
+    # Bring up interface
+    ip link set "$WIFI_IFACE" up 2>/dev/null || true
+fi
+
+# Configure display
+if command -v xrandr &> /dev/null; then
+    # Set native resolution if available
+    xrandr --output eDP-1 --mode 2736x1824 --rate 60 2>/dev/null || \
+    xrandr --output eDP1 --mode 2736x1824 --rate 60 2>/dev/null || \
+    xrandr --auto 2>/dev/null || true
+fi
+
+# Disable screen blanking
+xset s off 2>/dev/null || true
+xset -dpms 2>/dev/null || true
+xset s noblank 2>/dev/null || true
+
+# Hide cursor
+unclutter -idle 1 -root &
+
+# Write initial config if not present
+if [ ! -f "$CONFIG" ]; then
+    mkdir -p "$(dirname "$CONFIG")"
+    cat > "$CONFIG" << 'EOF'
+# SP7 Wireless Monitor Configuration
+# Run 'sp7-monitor setup' to reconfigure
+video_port=5004
+input_port=5005
+extra_args=--verbose
+EOF
+fi
+
+# Mark setup complete
+touch "$MARKER"
+info "Setup complete!"

@@ -1,0 +1,12 @@
+[Unit]
+Description=SP7 Monitor - Initial Setup
+After=systemd-user-sessions.service iptsd.service
+Before=sp7-monitor.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/sp7-monitor-setup
+RemainAfterExit=yes
+
+[Install]
+WantedBy=graphical.target
