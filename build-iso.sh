@@ -197,6 +197,23 @@ chroot "${CHROOT_DIR}" apt-get install -y -qq \
 
 ok "linux-surface kernel and iptsd installed"
 
+# ---------------------------------------------------------------------------
+# Up-to-date Wi-Fi firmware. Debian bookworm's firmware-iwlwifi tops out at
+# iwlwifi-cc-a0-72; the linux-surface kernel's iwlwifi driver needs newer
+# blobs (iwlwifi-cc-a0-77) for the Surface Pro 7's Intel AX201 — without them
+# Wi-Fi fails at boot with "no suitable firmware found" and no wlan device.
+# ---------------------------------------------------------------------------
+info "Installing up-to-date iwlwifi firmware..."
+FW_POOL="http://deb.debian.org/debian/pool/non-free-firmware/f/firmware-nonfree/"
+FW_DEB=$(curl -s "${FW_POOL}" | grep -oE 'firmware-iwlwifi_[^"]+_all\.deb' | sort -V | tail -1)
+if [ -z "${FW_DEB}" ]; then
+    error "Could not locate a current firmware-iwlwifi package in the Debian pool"
+fi
+curl -fsSL -o "${CHROOT_DIR}/tmp/firmware-iwlwifi.deb" "${FW_POOL}${FW_DEB}"
+chroot "${CHROOT_DIR}" dpkg -i /tmp/firmware-iwlwifi.deb 2>&1 | tail -2
+rm -f "${CHROOT_DIR}/tmp/firmware-iwlwifi.deb"
+ok "iwlwifi firmware updated (${FW_DEB})"
+
 # =============================================================================
 # STEP 5: Install receiver application dependencies
 # =============================================================================
