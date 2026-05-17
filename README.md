@@ -387,6 +387,7 @@ onward each change is a git commit.
 | **v5** | Embedded an early config in the GRUB EFI image so GRUB can locate `grub.cfg` on the ISO9660 volume; enlarged the ESP from 16 MB to a spec-compliant 33 MB FAT32. |
 | **v6** | ISO volume label `SP7-MONITOR` → `SP7MONITOR` — a hyphen is not a valid ISO9660 identifier character and broke the GRUB label search. |
 | **v7** | `debootstrap`: added `--components=main,contrib,non-free,non-free-firmware` so firmware/VA-API packages resolve; removed the non-existent `python3-asyncio` package. |
+| **v8** | Removed the VA-API driver variants `i965-va-driver-shaders` and `intel-media-va-driver-non-free` from the debootstrap include list — they `Conflict` with the standard drivers pulled in by `va-driver-all`, and debootstrap's raw `dpkg` cannot resolve that the way `apt` can. |
 
 ---
 
