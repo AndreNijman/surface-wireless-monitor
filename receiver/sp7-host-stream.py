@@ -8,19 +8,25 @@ pen/touch input from the Surface and injects it locally via uinput.
 
 Extended display vs mirror
 --------------------------
-By default (Hyprland) the host creates a *headless virtual output* at the
-Surface's 3:2 resolution: the Surface becomes a real second monitor with
-its own desktop. Pass --mirror to instead duplicate an existing screen.
+Two display modes, switchable at runtime:
+* extend (default): the host creates a headless virtual output at the
+  Surface's 3:2 resolution — the Surface becomes a real second monitor
+  with its own desktop.
+* mirror: the Surface duplicates an existing screen.
+
+Start in a mode with --mode extend|mirror (or --mirror). Switch a running
+host between the two at any time with `sp7-host-stream.py --toggle`, which
+signals the running instance (no restart, no dropped connection).
 
 Capture sources
 ---------------
 * X11 sessions: `ximagesrc` works directly (mirror only).
-* Wayland sessions (Hyprland): the virtual output — or, with --mirror, an
+* Wayland sessions (Hyprland): the virtual output — or, in mirror mode, an
   existing output — is captured via wf-recorder (wlr-screencopy).
 
-Usage: sp7-host-stream.py [--target <SP7_IP>] [--mirror] [--display WxH]
-                          [--fps N] [--bitrate KBPS] [--width W]
-                          [--no-input] [--verbose]
+Usage: sp7-host-stream.py [--target <SP7_IP>] [--mode extend|mirror]
+                          [--toggle] [--display WxH] [--fps N]
+                          [--bitrate KBPS] [--width W] [--no-input] [-v]
 """
 
 import os
@@ -69,6 +75,9 @@ DEFAULT_DISPLAY_H = 1080
 # uinput touch device name, and the slug Hyprland derives from it.
 TOUCH_DEVICE_NAME = 'SP7 Virtual Touchscreen'
 TOUCH_DEVICE_HYPR = 'sp7-virtual-touchscreen'
+
+# pidfile — lets `sp7-host --toggle` find a running instance to signal.
+PIDFILE = '/tmp/sp7-host.pid'
 
 
 def discover_surface(timeout: float = 6.0) -> Optional[str]:
@@ -553,17 +562,6 @@ class VirtualDisplay:
                     f"{self.width}x{self.height} (extended desktop)")
         return self.name
 
-    def bind_touch(self, hypr_device_name: str) -> None:
-        """Route the named touch device's input onto this display, so a
-        touch maps to the virtual desktop and not an existing screen."""
-        r = self._hyprctl('keyword',
-                           f'device[{hypr_device_name}]:output', self.name)
-        if r.returncode == 0 and 'ok' in r.stdout.lower():
-            logger.info(f"Touch input bound to {self.name}")
-        else:
-            logger.warning("Could not bind touch input to "
-                            f"{self.name}: {r.stdout.strip() or r.stderr.strip()}")
-
     def destroy(self) -> None:
         if self.name and self._created:
             self._hyprctl('output', 'remove', self.name)
@@ -571,28 +569,130 @@ class VirtualDisplay:
 
 
 # ---------------------------------------------------------------------------
+# Hyprland helpers shared by both display modes
+# ---------------------------------------------------------------------------
+def primary_output() -> Optional[str]:
+    """Name of the first real (non-headless) monitor — the screen that
+    'mirror' mode duplicates."""
+    try:
+        mons = json.loads(subprocess.run(
+            ['hyprctl', '-j', 'monitors'],
+            capture_output=True, text=True, timeout=8).stdout)
+        real = [m for m in mons if not m['name'].startswith('HEADLESS-')]
+        return (real or mons)[0]['name']
+    except Exception:
+        return None
+
+
+def set_touch_output(device_name: str, output_name: Optional[str]) -> None:
+    """Route a touch device's input onto a specific monitor."""
+    if not output_name:
+        return
+    try:
+        r = subprocess.run(
+            ['hyprctl', 'keyword',
+             f'device[{device_name}]:output', output_name],
+            capture_output=True, text=True, timeout=8)
+        if r.returncode == 0 and 'ok' in r.stdout.lower():
+            logger.info(f"Touch input bound to {output_name}")
+        else:
+            logger.warning(f"Could not bind touch to {output_name}: "
+                            f"{r.stdout.strip() or r.stderr.strip()}")
+    except Exception as e:
+        logger.warning(f"Touch bind failed: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Host server
 # ---------------------------------------------------------------------------
 class HostServer:
-    def __init__(self, target_ip, video_port, input_port, source,
-                 fps, bitrate, enable_input, width=0, virtual_display=None):
+    """Owns the capture/stream lifecycle and can switch, at runtime, between
+    'extend' (a headless virtual monitor) and 'mirror' (duplicating an
+    existing screen) — see switch_mode()."""
+
+    def __init__(self, target_ip, video_port, input_port, fps, bitrate,
+                 enable_input, width=0, mode='extend',
+                 display_res=(DEFAULT_DISPLAY_W, DEFAULT_DISPLAY_H),
+                 custom_source=None):
         self.target_ip = target_ip
         self.video_port = video_port
         self.input_port = input_port
-        self.source = source
         self.fps = fps
         self.bitrate = bitrate
         self.enable_input = enable_input
         self.width = width
-        self.virtual_display = virtual_display
+        self.mode = mode                    # 'extend' or 'mirror'
+        self.display_res = display_res
+        self.custom_source = custom_source
         self.streamer = None
         self.input_server = None
         self.advertiser = None
         self.beacon = None
         self.capture = None
+        self.virtual_display = None
+        self._switch_lock = threading.Lock()
         self._stop = threading.Event()
 
-    def start(self):
+    # -- capture construction ------------------------------------------------
+    def _build_capture(self) -> str:
+        """Build the capture for the current mode. Sets self.capture and
+        self.virtual_display; returns the GStreamer source string."""
+        if self.custom_source:
+            return self.custom_source
+
+        capture_output = None
+        if self.mode == 'extend':
+            try:
+                dw, dh = self.display_res
+                self.virtual_display = VirtualDisplay(dw, dh)
+                capture_output = self.virtual_display.create()
+            except Exception as e:
+                logger.error(f"Virtual display unavailable ({e}) — "
+                             f"using mirror mode")
+                self.virtual_display = None
+                self.mode = 'mirror'
+
+        if self.mode == 'mirror':
+            capture_output = primary_output()
+
+        src = detect_capture_source()
+        if src != 'wfrecorder':
+            # No Hyprland / X11 session — only a direct mirror is possible.
+            self.mode = 'mirror'
+            return src
+        try:
+            self.capture = WfRecorderCapture(output=capture_output)
+            source = self.capture.start()
+            logger.info(f"Capture source ({self.mode}): {source}")
+            return source
+        except Exception as e:
+            logger.error(f"wf-recorder capture failed: {e}")
+            if self.virtual_display:
+                self.virtual_display.destroy()
+                self.virtual_display = None
+            return 'videotestsrc is-live=true pattern=ball'
+
+    def _teardown_capture(self) -> None:
+        if self.capture:
+            self.capture.stop()
+            self.capture = None
+        if self.virtual_display:
+            self.virtual_display.destroy()
+            self.virtual_display = None
+
+    def _bind_touch(self) -> None:
+        """Route the virtual touchscreen onto whatever the Surface shows:
+        the headless output in extend mode, the mirrored screen otherwise."""
+        if not (self.enable_input and self.input_server
+                and self.input_server._uinput):
+            return
+        if self.virtual_display:
+            set_touch_output(TOUCH_DEVICE_HYPR, self.virtual_display.name)
+        else:
+            set_touch_output(TOUCH_DEVICE_HYPR, primary_output())
+
+    # -- lifecycle -----------------------------------------------------------
+    def start(self) -> None:
         logger.info("=" * 52)
         logger.info("  SP7 Monitor Host Server")
         logger.info(f"  target {self.target_ip}:{self.video_port}  "
@@ -600,25 +700,57 @@ class HostServer:
         logger.info("=" * 52)
         self.advertiser = ServiceAdvertiser(self.video_port)
         self.advertiser.start()
-        # Keep announcing ourselves so the Surface can (re)discover us and
-        # forward input back, even if its receiver restarts.
+        # Keep announcing ourselves so the Surface can (re)discover us.
         self.beacon = DiscoveryBeacon(DISCOVERY_PORT)
         self.beacon.start()
         if self.enable_input:
             self.input_server = InputServer(self.input_port)
             self.input_server.start()
-            # Route touch onto the virtual display once Hyprland has
-            # registered the hotplugged uinput device.
-            if self.virtual_display and self.input_server._uinput:
-                time.sleep(1.2)
-                self.virtual_display.bind_touch(TOUCH_DEVICE_HYPR)
+
+        source = self._build_capture()
+
+        if self.enable_input and self.input_server._uinput:
+            # Wait for Hyprland to register the hotplugged uinput device.
+            time.sleep(1.2)
+            self._bind_touch()
+
         self.streamer = VideoStreamer(self.target_ip, self.video_port,
-                                      self.source, self.fps, self.bitrate,
+                                      source, self.fps, self.bitrate,
                                       self.width)
         self.streamer.start()
-        logger.info("Host server running — Ctrl+C to stop")
+        logger.info(f"Host server running in '{self.mode}' mode — "
+                    f"'sp7-host --toggle' switches extend/mirror, "
+                    f"Ctrl+C stops")
 
-    def stop(self):
+    def switch_mode(self) -> None:
+        """Toggle between extend and mirror without restarting the server."""
+        if not self._switch_lock.acquire(blocking=False):
+            logger.warning("A mode switch is already in progress")
+            return
+        try:
+            if self.custom_source:
+                logger.warning("Cannot switch mode with an explicit --source")
+                return
+            new = 'mirror' if self.mode == 'extend' else 'extend'
+            logger.info(f"Switching display mode: {self.mode} -> {new}")
+            if self.streamer:
+                self.streamer.stop()
+                self.streamer = None
+            self._teardown_capture()
+            self.mode = new
+            source = self._build_capture()
+            self._bind_touch()
+            self.streamer = VideoStreamer(self.target_ip, self.video_port,
+                                          source, self.fps, self.bitrate,
+                                          self.width)
+            self.streamer.start()
+            logger.info(f"Display mode is now '{self.mode}'")
+        except Exception as e:
+            logger.error(f"Mode switch failed: {e}")
+        finally:
+            self._switch_lock.release()
+
+    def stop(self) -> None:
         logger.info("Shutting down host server...")
         self._stop.set()
         if self.streamer:
@@ -629,12 +761,9 @@ class HostServer:
             self.beacon.stop()
         if self.advertiser:
             self.advertiser.stop()
-        if self.capture:
-            self.capture.stop()
-        if self.virtual_display:
-            self.virtual_display.destroy()
+        self._teardown_capture()
 
-    def run(self):
+    def run(self) -> None:
         try:
             self.start()
             while not self._stop.is_set():
@@ -643,6 +772,19 @@ class HostServer:
             pass
         finally:
             self.stop()
+
+
+def _toggle_running_instance() -> int:
+    """Signal an already-running host to switch display mode."""
+    try:
+        with open(PIDFILE) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, signal.SIGUSR1)
+        print(f"Sent display-mode switch to sp7-host (pid {pid}).")
+        return 0
+    except (FileNotFoundError, ValueError, ProcessLookupError, PermissionError):
+        print("No running sp7-host instance found.", file=sys.stderr)
+        return 1
 
 
 def main():
@@ -663,17 +805,27 @@ def main():
                         help='downscale capture to this width before '
                              'encoding (even number; 0 = native, default). '
                              'Lower it if Wi-Fi cannot keep up.')
+    parser.add_argument('--mode', choices=['extend', 'mirror'],
+                        default='extend',
+                        help="'extend' (default): the Surface is a separate "
+                             "monitor with its own desktop. 'mirror': it "
+                             "duplicates an existing screen.")
     parser.add_argument('--mirror', action='store_true',
-                        help='mirror an existing screen instead of creating '
-                             'a separate extended display for the Surface')
+                        help='shorthand for --mode mirror')
+    parser.add_argument('--toggle', action='store_true',
+                        help='tell a running sp7-host to switch between '
+                             'extend and mirror, then exit')
     parser.add_argument('--display',
                         default=f'{DEFAULT_DISPLAY_W}x{DEFAULT_DISPLAY_H}',
-                        help='virtual extended-display resolution WxH '
-                             '(default: %(default)s, the Surface panel)')
+                        help='extended-display resolution WxH '
+                             '(default: %(default)s)')
     parser.add_argument('--no-input', action='store_true',
                         help='Disable pen/touch input reception')
     parser.add_argument('--verbose', '-v', action='store_true')
     args = parser.parse_args()
+
+    if args.toggle:
+        sys.exit(_toggle_running_instance())
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
@@ -689,57 +841,52 @@ def main():
 
     Gst.init(None)
 
-    # By default create a headless virtual output so the Surface is a
-    # genuine *extended* monitor with its own desktop. --mirror duplicates
-    # an existing screen instead; an explicit --source also skips this.
-    virtual_display = None
-    capture_output = None
-    if not args.mirror and not args.source:
-        try:
-            dw, dh = (int(v) for v in args.display.lower().split('x'))
-            virtual_display = VirtualDisplay(dw, dh)
-            capture_output = virtual_display.create()
-        except Exception as e:
-            logger.error(f"Virtual display unavailable ({e}) — "
-                         f"mirroring the primary screen instead")
-            virtual_display = None
-            capture_output = None
+    mode = 'mirror' if args.mirror else args.mode
+    try:
+        dw, dh = (int(v) for v in args.display.lower().split('x'))
+    except Exception:
+        logger.error(f"Invalid --display '{args.display}' — using default")
+        dw, dh = DEFAULT_DISPLAY_W, DEFAULT_DISPLAY_H
 
-    source = 'wfrecorder' if virtual_display \
-        else (args.source or detect_capture_source())
-    capture = None
-    if source == 'wfrecorder':
-        try:
-            capture = WfRecorderCapture(output=capture_output)
-            source = capture.start()
-            logger.info(f"Capture source: {source}")
-        except Exception as e:
-            logger.error(f"wf-recorder capture failed: {e}")
-            logger.error("Falling back to a test pattern (pass --source to override)")
-            source = 'videotestsrc is-live=true pattern=ball'
-            if virtual_display:
-                virtual_display.destroy()
-                virtual_display = None
-    elif source == 'portal':
+    # An explicit --source is a fixed custom pipeline and disables mode
+    # switching. '--source portal' resolves to an xdg-desktop-portal capture.
+    custom_source = args.source
+    if custom_source == 'portal':
         logger.info("Opening Wayland desktop capture via xdg-desktop-portal...")
         try:
             sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
             import portal_screencast
             fd, node = portal_screencast.open_screencast()
-            source = portal_screencast.gst_source(fd, node)
-            logger.info(f"Screencast source: {source}")
+            custom_source = portal_screencast.gst_source(fd, node)
+            logger.info(f"Screencast source: {custom_source}")
         except Exception as e:
             logger.error(f"Portal screencast failed: {e}")
-            logger.error("Falling back to a test pattern (pass --source to override)")
-            source = 'videotestsrc is-live=true pattern=ball'
+            custom_source = 'videotestsrc is-live=true pattern=ball'
 
     server = HostServer(target, args.video_port, args.input_port,
-                        source, args.fps, args.bitrate, not args.no_input,
-                        args.width, virtual_display)
-    server.capture = capture
+                        args.fps, args.bitrate, not args.no_input,
+                        args.width, mode, (dw, dh), custom_source)
+
+    # pidfile so `sp7-host --toggle` can find this instance to signal.
+    try:
+        with open(PIDFILE, 'w') as f:
+            f.write(str(os.getpid()))
+    except OSError:
+        pass
+
     signal.signal(signal.SIGINT, lambda *_: server.stop())
     signal.signal(signal.SIGTERM, lambda *_: server.stop())
-    server.run()
+    # SIGUSR1 -> switch display mode (handled off the signal thread).
+    signal.signal(signal.SIGUSR1,
+                  lambda *_: threading.Thread(target=server.switch_mode,
+                                              daemon=True).start())
+    try:
+        server.run()
+    finally:
+        try:
+            os.remove(PIDFILE)
+        except OSError:
+            pass
 
 
 if __name__ == '__main__':

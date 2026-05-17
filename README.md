@@ -260,7 +260,30 @@ The streamer auto-detects how to capture the screen:
     see `receiver/portal_screencast.py`).
   - `--source "<any GStreamer source fragment>"` — full manual control.
 
-Other options: `--fps`, `--bitrate` (kbps), `--no-input`, `--input-port`.
+Other options: `--fps`, `--bitrate` (kbps), `--width`, `--no-input`,
+`--input-port`.
+
+### Extended monitor vs. mirror
+
+The host runs in one of two display modes:
+
+- **`--mode extend`** (default) — on Hyprland the host creates a *headless
+  virtual output* at the Surface's 3:2 resolution (`1620x1080` by default,
+  set with `--display WxH`). The Surface becomes a genuine **second
+  monitor** with its own desktop; drag windows onto it.
+- **`--mode mirror`** (or `--mirror`) — the Surface **duplicates** an
+  existing screen.
+
+Switch a **running** host between the two at any time — no restart, no
+dropped connection:
+
+```bash
+python3 receiver/sp7-host-stream.py --toggle
+```
+
+`--toggle` signals the running instance (found via `/tmp/sp7-host.pid`) to
+swap modes. Touch input is automatically re-routed to whichever screen the
+Surface is currently showing.
 
 ---
 
