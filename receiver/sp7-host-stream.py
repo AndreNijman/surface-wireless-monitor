@@ -2,271 +2,160 @@
 """
 SP7 Host Streaming Server
 =========================
-Runs on the host PC (Linux), captures the desktop display,
-encodes to H.264 with hardware acceleration, and streams
-to the Surface Pro 7 receiver over UDP/RTP.
+Runs on the host PC. Captures the desktop, encodes it to H.264, and
+streams it as RTP/UDP to the Surface Pro 7 receiver. Also receives
+pen/touch input from the Surface and injects it locally via uinput.
 
-Also receives pen/touch input events from the SP7 and injects
-them into the local input system via uinput.
+Capture sources
+---------------
+* X11 sessions: `ximagesrc` works directly.
+* Wayland sessions (Hyprland/sway/...): X11 capture sees only a black
+  XWayland root. Use --source with a PipeWire screencast portal source
+  (see receiver/portal_screencast.py), or --source "videotestsrc is-live=true"
+  for a test pattern.
 
-Usage: sp7-host-stream.py [--display DISPLAY] [--target TARGET_IP]
+Usage: sp7-host-stream.py --target <SP7_IP> [--source GST_SRC] [--fps N]
+                          [--bitrate KBPS] [--no-input] [--verbose]
 """
 
 import os
 import sys
 import time
-import json
 import socket
 import signal
-import struct
 import logging
 import argparse
 import subprocess
 import threading
-import asyncio
-from pathlib import Path
-from typing import Optional, Callable
+from typing import Optional
 
-try:
-    import gi
-    gi.require_version('Gst', '1.0')
-    from gi.repository import Gst, GLib
-except ImportError:
-    pass
+import gi
+gi.require_version('Gst', '1.0')
+from gi.repository import Gst, GLib
 
 try:
     import msgpack
 except ImportError:
-    print("ERROR: msgpack not installed. Run: pip3 install msgpack")
+    print("ERROR: msgpack not installed (pip3 install msgpack)", file=sys.stderr)
     sys.exit(1)
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-    datefmt='%H:%M:%S'
+    datefmt='%H:%M:%S',
 )
 logger = logging.getLogger('sp7-host')
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
 DEFAULT_VIDEO_PORT = 5004
 DEFAULT_INPUT_PORT = 5005
-DEFAULT_FPS = 60
-DEFAULT_BITRATE = 25000  # kbps
+DEFAULT_FPS = 30
+DEFAULT_BITRATE = 12000  # kbps
+
 
 # ---------------------------------------------------------------------------
-# Pipeline builders
+# Capture / encoder selection
 # ---------------------------------------------------------------------------
-def build_capture_pipeline(display: str, fps: int, bitrate: int,
-                           target_ip: str, target_port: int) -> str:
-    """
-    Build a GStreamer pipeline for screen capture and H.264 streaming.
-    Attempts hardware encoding, falls back to software.
-    """
-    # Detect available encoder
-    encoder = detect_encoder()
-
-    # Capture source (auto-detect best method)
-    source = detect_capture_source(display)
-
-    # Video scaling/filtering
-    caps = f"video/x-raw,framerate={fps}/1"
-
-    # Encoder-specific settings
-    if encoder == 'vaapi':
-        # Intel VAAPI hardware encoding
-        encode_pipeline = (
-            f"{source} ! {caps} ! "
-            "vaapih264enc rate-control=cbr bitrate={bitrate} keyframe-period={gop} "
-            "tune=low_latency num-slices=4 ! "
-            "video/x-h264,profile=baseline,stream-format=byte-stream ! "
-        )
-    elif encoder == 'nvenc':
-        # NVIDIA NVENC
-        encode_pipeline = (
-            f"{source} ! {caps} ! "
-            "nvh264enc bitrate={bitrate} preset=low-latency-hq rc-mode=cbr "
-            "gop-size={gop} bframes=0 ! "
-            "video/x-h264,profile=baseline,stream-format=byte-stream ! "
-        )
-    elif encoder == 'x264':
-        # Software x264
-        encode_pipeline = (
-            f"{source} ! {caps} ! "
-            "videoconvert ! video/x-raw,format=I420 ! "
-            "x264enc bitrate={kbps} speed-preset=ultrafast "
-            "tune=zerolatency key-int-max={gop} vbv-buf-capacity=0 "
-            "bframes=0 byte-stream=true ! "
-            "video/x-h264,profile=baseline,stream-format=byte-stream ! "
-        )
-    else:
-        # Software fallback with avenc
-        encode_pipeline = (
-            f"{source} ! {caps} ! "
-            "videoconvert ! video/x-raw,format=I420 ! "
-            "avenc_h264_omx bitrate={bitrate}000 gop-size={gop} ! "
-        )
-
-    # Complete pipeline with RTP packaging
-    gop = fps * 2  # 2-second GOP
-    kbps = bitrate // 1000
-
-    pipeline = (
-        encode_pipeline.format(bitrate=bitrate, kbps=kbps, gop=gop) +
-        "h264parse config-interval=1 ! "
-        f"rtph264pay pt=96 mtu=1400 ! "
-        f"udpsink host={target_ip} port={target_port} sync=false buffer-size=524288"
-    )
-
-    logger.info(f"Using encoder: {encoder}")
-    logger.info(f"Capture source: {source}")
-    return pipeline
+def _have(element: str) -> bool:
+    return Gst.ElementFactory.find(element) is not None
 
 
 def detect_encoder() -> str:
-    """Detect the best available H.264 encoder."""
-    # Check VAAPI (Intel/AMD)
-    try:
-        result = subprocess.run(
-            ['gst-inspect-1.0', 'vaapih264enc'],
-            capture_output=True, timeout=5
-        )
-        if result.returncode == 0:
-            return 'vaapi'
-    except:
-        pass
-
-    # Check NVENC (NVIDIA)
-    try:
-        result = subprocess.run(
-            ['gst-inspect-1.0', 'nvh264enc'],
-            capture_output=True, timeout=5
-        )
-        if result.returncode == 0:
-            return 'nvenc'
-    except:
-        pass
-
-    # Fallback to x264
-    return 'x264'
+    """Pick the best available H.264 encoder element."""
+    for enc in ('vah264enc', 'vaapih264enc', 'nvh264enc', 'x264enc'):
+        if _have(enc):
+            return enc
+    return 'x264enc'
 
 
-def detect_capture_source(display: str) -> str:
-    """Detect the best screen capture source."""
-    # Try pipewire (modern, Wayland-compatible)
-    try:
-        result = subprocess.run(
-            ['gst-inspect-1.0', 'pipewiresrc'],
-            capture_output=True, timeout=5
-        )
-        if result.returncode == 0:
-            logger.info("Using PipeWire capture source")
-            return "pipewiresrc"
-    except:
-        pass
+def detect_capture_source() -> str:
+    """Best-effort default capture source. --source overrides this."""
+    session = os.environ.get('XDG_SESSION_TYPE', '')
+    if session == 'wayland':
+        logger.warning("Wayland session: X11 capture would be blank. "
+                        "Pass --source with a PipeWire portal source "
+                        "(see portal_screencast.py). Using a test pattern.")
+        return 'videotestsrc is-live=true pattern=ball'
+    if _have('ximagesrc'):
+        disp = os.environ.get('DISPLAY', ':0')
+        logger.info(f"X11 capture via ximagesrc (display {disp})")
+        return f'ximagesrc display-name={disp} use-damage=false show-pointer=true'
+    logger.warning("No capture source detected — using a test pattern")
+    return 'videotestsrc is-live=true pattern=ball'
 
-    # Try ximagesrc (X11)
-    try:
-        result = subprocess.run(
-            ['gst-inspect-1.0', 'ximagesrc'],
-            capture_output=True, timeout=5
-        )
-        if result.returncode == 0:
-            logger.info("Using X11 capture source")
-            d = display or os.environ.get('DISPLAY', ':0')
-            return f"ximagesrc display-name={d} use-damage=false show-pointer=true"
-    except:
-        pass
 
-    # Try kms (DRM direct capture)
-    try:
-        result = subprocess.run(
-            ['gst-inspect-1.0', 'kmssrc'],
-            capture_output=True, timeout=5
-        )
-        if result.returncode == 0:
-            logger.info("Using KMS/DRM capture source")
-            return "kmssrc"
-    except:
-        pass
+def build_capture_pipeline(source: str, fps: int, bitrate: int,
+                           target_ip: str, target_port: int) -> str:
+    """Assemble the capture -> H.264 -> RTP/UDP pipeline."""
+    enc = detect_encoder()
+    if enc == 'x264enc':
+        encstr = (f'x264enc bitrate={bitrate} speed-preset=ultrafast '
+                  f'tune=zerolatency key-int-max={fps * 2}')
+    elif enc == 'vaapih264enc':
+        encstr = f'vaapih264enc rate-control=cbr bitrate={bitrate}'
+    elif enc == 'vah264enc':
+        encstr = f'vah264enc bitrate={bitrate}'
+    elif enc == 'nvh264enc':
+        encstr = f'nvh264enc bitrate={bitrate} gop-size={fps * 2} bframes=0'
+    else:
+        encstr = enc
 
-    # Ultimate fallback
-    logger.warning("No optimized capture source found, using videotestsrc")
-    return "videotestsrc is-live=true"
+    # No pinned pixel format: videoconvert negotiates whatever the chosen
+    # encoder accepts (I420 for x264enc, NV12 for the VA-API encoders).
+    pipeline = (
+        f"{source} ! videorate ! video/x-raw,framerate={fps}/1 ! "
+        f"videoconvert ! videoscale ! {encstr} ! "
+        f"h264parse config-interval=1 ! "
+        f"rtph264pay pt=96 mtu=1400 config-interval=1 ! "
+        f"udpsink host={target_ip} port={target_port} sync=false"
+    )
+    logger.info(f"Encoder: {enc}")
+    logger.info(f"Pipeline: {pipeline}")
+    return pipeline
 
 
 # ---------------------------------------------------------------------------
-# Video Streamer
+# Video streamer
 # ---------------------------------------------------------------------------
 class VideoStreamer:
-    """Captures desktop and streams H.264 to SP7 receiver."""
-
-    def __init__(self, target_ip: str, video_port: int, display: str,
-                 fps: int, bitrate: int):
+    def __init__(self, target_ip, video_port, source, fps, bitrate):
         self.target_ip = target_ip
         self.video_port = video_port
-        self.display = display
+        self.source = source
         self.fps = fps
         self.bitrate = bitrate
         self.pipeline: Optional[Gst.Pipeline] = None
         self.loop: Optional[GLib.MainLoop] = None
-        self._running = False
-        self._thread: Optional[threading.Thread] = None
 
     def start(self):
-        """Start the video stream."""
         Gst.init(None)
-
-        pipeline_str = build_capture_pipeline(
-            self.display, self.fps, self.bitrate,
-            self.target_ip, self.video_port
-        )
-
-        logger.info(f"Pipeline: {pipeline_str}")
-
-        self.pipeline = Gst.parse_launch(pipeline_str)
-        if not self.pipeline:
-            raise RuntimeError("Failed to create GStreamer pipeline")
-
-        # Bus watch
+        desc = build_capture_pipeline(self.source, self.fps, self.bitrate,
+                                      self.target_ip, self.video_port)
+        self.pipeline = Gst.parse_launch(desc)
         bus = self.pipeline.get_bus()
         bus.add_signal_watch()
         bus.connect("message", self._on_bus_message)
-
-        # Start playing
         ret = self.pipeline.set_state(Gst.State.PLAYING)
         if ret == Gst.StateChangeReturn.FAILURE:
-            raise RuntimeError("Failed to start pipeline")
-
-        self._running = True
-        logger.info(f"Streaming to {self.target_ip}:{self.video_port}")
-
-        # Run GLib main loop
+            raise RuntimeError("Failed to start streaming pipeline")
+        logger.info(f"Streaming to {self.target_ip}:{self.video_port} "
+                    f"@ {self.fps}fps {self.bitrate}kbps")
         self.loop = GLib.MainLoop()
-        self._thread = threading.Thread(target=self.loop.run, daemon=True)
-        self._thread.start()
+        threading.Thread(target=self.loop.run, daemon=True).start()
 
     def _on_bus_message(self, bus, message):
-        """Handle GStreamer bus messages."""
         t = message.type
-        if t == Gst.MessageType.EOS:
-            logger.info("End of stream")
-            self._running = False
-        elif t == Gst.MessageType.ERROR:
-            err, debug = message.parse_error()
-            logger.error(f"GStreamer error: {err.message}")
-            self._running = False
+        if t == Gst.MessageType.ERROR:
+            err, dbg = message.parse_error()
+            logger.error(f"GStreamer error: {err.message} ({dbg})")
         elif t == Gst.MessageType.WARNING:
-            warn, debug = message.parse_warning()
-            logger.warning(f"GStreamer warning: {warn.message}")
+            w, _ = message.parse_warning()
+            logger.warning(f"GStreamer warning: {w.message}")
+        elif t == Gst.MessageType.STATE_CHANGED and message.src == self.pipeline:
+            _, new, _ = message.parse_state_changed()
+            if new == Gst.State.PLAYING:
+                logger.info("Streaming pipeline is PLAYING")
 
     def stop(self):
-        """Stop streaming."""
-        self._running = False
         if self.loop:
             self.loop.quit()
         if self.pipeline:
@@ -275,366 +164,238 @@ class VideoStreamer:
 
 
 # ---------------------------------------------------------------------------
-# Input Server (receives pen/touch from SP7)
+# Input server — receives pen/touch from the SP7, injects via uinput
 # ---------------------------------------------------------------------------
 class InputServer:
-    """
-    Receives pen/touch input events from Surface Pro 7
-    and injects them via uinput.
-    """
-
-    def __init__(self, port: int, sp7_width: int, sp7_height: int):
+    def __init__(self, port: int):
         self.port = port
-        self.sp7_width = sp7_width
-        self.sp7_height = sp7_height
         self._running = False
         self._socket: Optional[socket.socket] = None
-        self._thread: Optional[threading.Thread] = None
-        self._uinput_dev = None
+        self._uinput = None
+        self.screen_w, self.screen_h = self._screen_size()
 
-    def _setup_uinput(self):
-        """Create a uinput virtual pen device."""
+    @staticmethod
+    def _screen_size() -> tuple:
+        # Hyprland
         try:
-            import evdev
+            import json
+            out = subprocess.run(['hyprctl', '-j', 'monitors'],
+                                 capture_output=True, text=True, timeout=5)
+            mons = json.loads(out.stdout)
+            if mons:
+                m = mons[0]
+                return int(m['width']), int(m['height'])
+        except Exception:
+            pass
+        # X11 / XWayland
+        try:
+            out = subprocess.run(['xrandr'], capture_output=True,
+                                 text=True, timeout=5)
+            for line in out.stdout.splitlines():
+                if '*' in line:
+                    w, h = line.split()[0].split('x')
+                    return int(w), int(h)
+        except Exception:
+            pass
+        return 1920, 1080
+
+    def _setup_uinput(self) -> bool:
+        try:
             from evdev import UInput, AbsInfo, ecodes as e
-
-            # Get screen dimensions
-            self.screen_w, self.screen_h = self._get_screen_size()
-
-            # Define pen capabilities
-            cap = {
-                e.EV_KEY: [e.BTN_TOOL_PEN, e.BTN_TOOL_RUBBER, e.BTN_TOUCH,
-                          e.BTN_STYLUS, e.BTN_STYLUS2],
-                e.EV_ABS: [
-                    (e.ABS_X, AbsInfo(0, 0, self.screen_w, 0, 0, self.screen_w)),
-                    (e.ABS_Y, AbsInfo(0, 0, self.screen_h, 0, 0, self.screen_h)),
-                    (e.ABS_PRESSURE, AbsInfo(0, 0, 4095, 0, 0, 4095)),
-                    (e.ABS_TILT_X, AbsInfo(-90, -90, 90, 0, 0, 180)),
-                    (e.ABS_TILT_Y, AbsInfo(-90, -90, 90, 0, 0, 180)),
-                ],
-            }
-
-            self._uinput_dev = UInput(cap, name='SP7 Virtual Pen', version=0x3)
-            logger.info(f"uinput device created: {self.screen_w}x{self.screen_h}")
-            return True
-
         except ImportError:
-            logger.error("python-evdev not installed, input injection disabled")
+            logger.error("python-evdev not installed — input injection off")
             return False
-        except PermissionError:
-            logger.error("Permission denied for uinput. Run as root or add user to 'input' group.")
-            return False
-
-    def _get_screen_size(self) -> tuple:
-        """Get the current screen size."""
+        cap = {
+            e.EV_KEY: [e.BTN_TOOL_PEN, e.BTN_TOUCH, e.BTN_STYLUS],
+            e.EV_ABS: [
+                (e.ABS_X, AbsInfo(0, 0, self.screen_w, 0, 0, 0)),
+                (e.ABS_Y, AbsInfo(0, 0, self.screen_h, 0, 0, 0)),
+                (e.ABS_PRESSURE, AbsInfo(0, 0, 4095, 0, 0, 0)),
+                (e.ABS_TILT_X, AbsInfo(0, -90, 90, 0, 0, 0)),
+                (e.ABS_TILT_Y, AbsInfo(0, -90, 90, 0, 0, 0)),
+            ],
+        }
         try:
-            import Xlib.display
-            display = Xlib.display.Display()
-            screen = display.screen()
-            return screen.width_in_pixels, screen.height_in_pixels
-        except:
-            try:
-                result = subprocess.run(
-                    ['xrandr'], capture_output=True, text=True, timeout=5
-                )
-                for line in result.stdout.split('\n'):
-                    if '*' in line:
-                        parts = line.split()[0].split('x')
-                        return int(parts[0]), int(parts[1])
-            except:
-                pass
-        return 1920, 1080  # Default fallback
+            self._uinput = UInput(cap, name='SP7 Virtual Pen', version=0x3)
+        except PermissionError:
+            logger.error("No permission for /dev/uinput — run as root or add "
+                          "the user to the 'input' group")
+            return False
+        except Exception as ex:
+            logger.error(f"uinput setup failed: {ex}")
+            return False
+        logger.info(f"uinput pen device created ({self.screen_w}x{self.screen_h})")
+        return True
 
-    def _receive_loop(self):
-        """Receive input events and inject."""
+    def _inject(self, pkt: dict):
+        from evdev import ecodes as e
+        d = self._uinput
+        x = max(0, min(self.screen_w, int(pkt.get('x', 0) * self.screen_w)))
+        y = max(0, min(self.screen_h, int(pkt.get('y', 0) * self.screen_h)))
+        d.write(e.EV_ABS, e.ABS_X, x)
+        d.write(e.EV_ABS, e.ABS_Y, y)
+        d.write(e.EV_ABS, e.ABS_PRESSURE,
+                max(0, min(4095, int(pkt.get('p', 0) * 4095))))
+        d.write(e.EV_ABS, e.ABS_TILT_X, max(-90, min(90, int(pkt.get('tx', 0) * 90))))
+        d.write(e.EV_ABS, e.ABS_TILT_Y, max(-90, min(90, int(pkt.get('ty', 0) * 90))))
+        d.write(e.EV_KEY, e.BTN_TOOL_PEN, 1 if pkt.get('rng') else 0)
+        d.write(e.EV_KEY, e.BTN_TOUCH, 1 if pkt.get('tip') else 0)
+        d.write(e.EV_KEY, e.BTN_STYLUS, 1 if pkt.get('btn') else 0)
+        d.syn()
+
+    def _loop(self):
         try:
             self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self._socket.bind(('0.0.0.0', self.port))
             self._socket.settimeout(1.0)
-        except Exception as e:
-            logger.error(f"Failed to bind socket: {e}")
+        except Exception as ex:
+            logger.error(f"Input socket bind failed: {ex}")
             return
-
-        logger.info(f"Input server listening on port {self.port}")
-
-        packets_received = 0
-        last_stats = time.time()
-
+        logger.info(f"Input server listening on UDP :{self.port}")
+        count, last = 0, time.time()
         while self._running:
             try:
-                data, addr = self._socket.recvfrom(1024)
-                packet = msgpack.unpackb(data, raw=False)
-
-                if self._uinput_dev:
-                    self._inject_event(packet)
-
-                packets_received += 1
-
-                # Stats
-                now = time.time()
-                if now - last_stats >= 10.0:
-                    logger.info(f"Input: {packets_received} packets/10s")
-                    packets_received = 0
-                    last_stats = now
-
+                data, addr = self._socket.recvfrom(2048)
+                pkt = msgpack.unpackb(data, raw=False)
+                if self._uinput:
+                    self._inject(pkt)
+                count += 1
+                if time.time() - last >= 10:
+                    logger.info(f"Input: {count} events/10s from {addr[0]}")
+                    count, last = 0, time.time()
             except socket.timeout:
                 continue
-            except Exception as e:
+            except Exception as ex:
                 if self._running:
-                    logger.error(f"Input receive error: {e}")
-
+                    logger.debug(f"Input recv error: {ex}")
         logger.info("Input server stopped")
 
-    def _inject_event(self, packet: dict):
-        """Inject an input event via uinput."""
-        try:
-            from evdev import ecodes as e
-
-            dev = self._uinput_dev
-            x = int(packet.get('x', 0) * self.screen_w)
-            y = int(packet.get('y', 0) * self.screen_h)
-            pressure = int(packet.get('p', 0) * 4095)
-            tilt_x = int(packet.get('tx', 0) * 90)
-            tilt_y = int(packet.get('ty', 0) * 90)
-            touching = packet.get('tip', False)
-            in_range = packet.get('rng', False)
-            tool = packet.get('tool', 'none')
-            btn1 = packet.get('btn1', False)
-            btn2 = packet.get('btn2', False)
-
-            # Write absolute axis events
-            dev.write(e.EV_ABS, e.ABS_X, max(0, min(self.screen_w, x)))
-            dev.write(e.EV_ABS, e.ABS_Y, max(0, min(self.screen_h, y)))
-            dev.write(e.EV_ABS, e.ABS_PRESSURE, max(0, min(4095, pressure)))
-            dev.write(e.EV_ABS, e.ABS_TILT_X, max(-90, min(90, tilt_x)))
-            dev.write(e.EV_ABS, e.ABS_TILT_Y, max(-90, min(90, tilt_y)))
-
-            # Write key events
-            dev.write(e.EV_KEY, e.BTN_TOOL_PEN, 1 if in_range and tool == 'pen' else 0)
-            dev.write(e.EV_KEY, e.BTN_TOOL_RUBBER, 1 if in_range and tool == 'eraser' else 0)
-            dev.write(e.EV_KEY, e.BTN_TOUCH, 1 if touching else 0)
-            dev.write(e.EV_KEY, e.BTN_STYLUS, 1 if btn1 else 0)
-            dev.write(e.EV_KEY, e.BTN_STYLUS2, 1 if btn2 else 0)
-
-            # Sync
-            dev.write(e.EV_SYN, e.SYN_REPORT, 0)
-            dev.syn()
-
-        except Exception as e:
-            logger.debug(f"Injection error: {e}")
-
     def start(self):
-        """Start the input server."""
         self._running = True
         self._setup_uinput()
-
-        self._thread = threading.Thread(target=self._receive_loop, daemon=True)
-        self._thread.start()
-        logger.info("Input server started")
+        threading.Thread(target=self._loop, daemon=True).start()
 
     def stop(self):
-        """Stop the input server."""
         self._running = False
         if self._socket:
             try:
                 self._socket.close()
-            except:
+            except Exception:
                 pass
-        if self._thread:
-            self._thread.join(timeout=3.0)
-        if self._uinput_dev:
+        if self._uinput:
             try:
-                self._uinput_dev.close()
-            except:
+                self._uinput.close()
+            except Exception:
                 pass
-        logger.info("Input server stopped")
 
 
 # ---------------------------------------------------------------------------
-# mDNS Service Advertisement
+# mDNS advertisement (best-effort)
 # ---------------------------------------------------------------------------
 class ServiceAdvertiser:
-    """Advertise the SP7 monitor host service via mDNS/DNS-SD."""
-
     def __init__(self, port: int):
         self.port = port
-        self._running = False
+        self._proc = None
 
     def start(self):
-        """Start advertising via avahi-publish or python-zeroconf."""
-        self._running = True
-
-        # Try avahi-publish first
         try:
-            subprocess.Popen(
-                ['avahi-publish-service', 'sp7-monitor-host', '_sp7monitor._tcp',
-                 str(self.port), 'version=1.0', 'proto=udp'],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-            logger.info("mDNS service advertised via avahi")
-            return
+            self._proc = subprocess.Popen(
+                ['avahi-publish-service', 'sp7-monitor-host',
+                 '_sp7monitor._tcp', str(self.port)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            logger.info("mDNS service advertised (_sp7monitor._tcp)")
         except FileNotFoundError:
-            pass
-
-        # Fallback: try python-zeroconf
-        try:
-            from zeroconf import Zeroconf, ServiceInfo
-            import socket
-
-            hostname = socket.gethostname()
-            ip = socket.gethostbyname(hostname)
-
-            info = ServiceInfo(
-                "_sp7monitor._tcp.local.",
-                f"{hostname}._sp7monitor._tcp.local.",
-                addresses=[socket.inet_aton(ip)],
-                port=self.port,
-                properties={"version": "1.0", "proto": "udp"}
-            )
-            self._zeroconf = Zeroconf()
-            self._zeroconf.register_service(info)
-            logger.info(f"mDNS service advertised via zeroconf ({ip})")
-        except Exception as e:
-            logger.warning(f"Could not advertise mDNS service: {e}")
+            logger.debug("avahi-publish-service not available — skipping mDNS")
 
     def stop(self):
-        self._running = False
-        if hasattr(self, '_zeroconf'):
-            try:
-                self._zeroconf.unregister_all_services()
-                self._zeroconf.close()
-            except:
-                pass
+        if self._proc:
+            self._proc.terminate()
 
 
 # ---------------------------------------------------------------------------
-# Main Host Server
+# Host server
 # ---------------------------------------------------------------------------
 class HostServer:
-    """Main host server coordinating video streaming and input reception."""
-
-    def __init__(self, target_ip: str, video_port: int, input_port: int,
-                 display: str, fps: int, bitrate: int):
+    def __init__(self, target_ip, video_port, input_port, source,
+                 fps, bitrate, enable_input):
         self.target_ip = target_ip
         self.video_port = video_port
         self.input_port = input_port
-        self.display = display
+        self.source = source
         self.fps = fps
         self.bitrate = bitrate
-
-        self.streamer: Optional[VideoStreamer] = None
-        self.input_server: Optional[InputServer] = None
-        self.advertiser: Optional[ServiceAdvertiser] = None
+        self.enable_input = enable_input
+        self.streamer = None
+        self.input_server = None
+        self.advertiser = None
+        self._stop = threading.Event()
 
     def start(self):
-        """Start all host services."""
-        logger.info("=" * 50)
-        logger.info("  SP7 Monitor Host Server Starting")
-        logger.info("=" * 50)
-        logger.info(f"Target: {self.target_ip}:{self.video_port}")
-        logger.info(f"Input port: {self.input_port}")
-        logger.info(f"Display: {self.display}")
-        logger.info(f"FPS: {self.fps}, Bitrate: {self.bitrate}kbps")
-
-        # Advertise service
+        logger.info("=" * 52)
+        logger.info("  SP7 Monitor Host Server")
+        logger.info(f"  target {self.target_ip}:{self.video_port}  "
+                    f"input :{self.input_port}")
+        logger.info("=" * 52)
         self.advertiser = ServiceAdvertiser(self.video_port)
         self.advertiser.start()
-
-        # Start input server
-        self.input_server = InputServer(
-            self.input_port,
-            sp7_width=2736, sp7_height=1824
-        )
-        self.input_server.start()
-
-        # Start video stream
-        self.streamer = VideoStreamer(
-            self.target_ip, self.video_port,
-            self.display, self.fps, self.bitrate
-        )
+        if self.enable_input:
+            self.input_server = InputServer(self.input_port)
+            self.input_server.start()
+        self.streamer = VideoStreamer(self.target_ip, self.video_port,
+                                      self.source, self.fps, self.bitrate)
         self.streamer.start()
-
-        logger.info("=" * 50)
-        logger.info("  Host server running. Press Ctrl+C to stop.")
-        logger.info("=" * 50)
+        logger.info("Host server running — Ctrl+C to stop")
 
     def stop(self):
-        """Stop all services."""
         logger.info("Shutting down host server...")
+        self._stop.set()
         if self.streamer:
             self.streamer.stop()
         if self.input_server:
             self.input_server.stop()
         if self.advertiser:
             self.advertiser.stop()
-        logger.info("Host server stopped")
 
     def run(self):
-        """Run until interrupted."""
         try:
             self.start()
-            while True:
-                time.sleep(1)
+            while not self._stop.is_set():
+                self._stop.wait(1.0)
         except KeyboardInterrupt:
-            logger.info("Interrupted")
+            pass
         finally:
             self.stop()
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(
-        description='SP7 Monitor Host - Stream display and receive pen input',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  %(prog)s --target 192.168.1.50          Stream to SP7 at given IP
-  %(prog)s --target 192.168.1.50 --fps 30  30 FPS for smoother performance
-  %(prog)s --target 192.168.1.50 -d :0    Capture display :0
-
-Prerequisites:
-  - GStreamer with capture source (ximagesrc/pipewiresrc)
-  - H.264 encoder (vaapih264enc/nvh264enc/x264enc)
-  - python-evdev for input injection
-  - msgpack for network serialization
-        """
-    )
+    parser = argparse.ArgumentParser(description='SP7 Monitor Host Streamer')
     parser.add_argument('--target', '-t', required=True,
-                        help='SP7 receiver IP address')
+                        help='Surface Pro 7 receiver IP address')
     parser.add_argument('--video-port', type=int, default=DEFAULT_VIDEO_PORT)
     parser.add_argument('--input-port', type=int, default=DEFAULT_INPUT_PORT)
-    parser.add_argument('--display', '-d', default=':0',
-                        help='X11 display to capture (default: :0)')
-    parser.add_argument('--fps', type=int, default=DEFAULT_FPS,
-                        help=f'Frames per second (default: {DEFAULT_FPS})')
+    parser.add_argument('--source', '-s',
+                        help='GStreamer capture source (overrides autodetect), '
+                             'e.g. "videotestsrc is-live=true" or a '
+                             '"pipewiresrc fd=N path=M" portal source')
+    parser.add_argument('--fps', type=int, default=DEFAULT_FPS)
     parser.add_argument('--bitrate', type=int, default=DEFAULT_BITRATE,
-                        help=f'Bitrate in kbps (default: {DEFAULT_BITRATE})')
+                        help='kbps (default: %(default)s)')
     parser.add_argument('--no-input', action='store_true',
-                        help='Disable input reception')
+                        help='Disable pen/touch input reception')
     parser.add_argument('--verbose', '-v', action='store_true')
-
     args = parser.parse_args()
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
     Gst.init(None)
+    source = args.source or detect_capture_source()
 
-    server = HostServer(
-        target_ip=args.target,
-        video_port=args.video_port,
-        input_port=args.input_port,
-        display=args.display,
-        fps=args.fps,
-        bitrate=args.bitrate
-    )
-
-    signal.signal(signal.SIGINT, lambda s, f: server.stop())
-    signal.signal(signal.SIGTERM, lambda s, f: server.stop())
-
+    server = HostServer(args.target, args.video_port, args.input_port,
+                        source, args.fps, args.bitrate, not args.no_input)
+    signal.signal(signal.SIGINT, lambda *_: server.stop())
+    signal.signal(signal.SIGTERM, lambda *_: server.stop())
     server.run()
 
 

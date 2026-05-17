@@ -2,29 +2,35 @@
 """
 SP7 Wireless Monitor Receiver
 =============================
-Runs on the Surface Pro 7, receives video stream from host PC,
-displays it on the built-in screen, and captures touch/pen input
-for forwarding back to the host.
+Runs on the Surface Pro 7. Listens for an H.264 video stream from a host
+PC and renders it full-screen via DRM/KMS, and forwards the Surface's
+pen/touch input back to the host.
 
-Usage: sp7-receiver.py [--host HOST] [--port PORT]
+Design notes
+------------
+* The video path is a *listener* (`udpsrc`) — it needs no host address.
+  The receiver therefore starts the video pipeline immediately and keeps
+  it running whether or not a host is known.
+* The host address is only needed to forward input *back*. It is taken
+  from --host, then /etc/sp7-monitor/config.conf, then mDNS discovery.
+  If none is found the receiver still runs (video-only); it never exits.
+* Runs as a systemd service with no controlling terminal — there is no
+  interactive prompting anywhere.
 
-Auto-discovers host via mDNS if not specified.
+Usage: sp7-receiver.py [--host HOST] [--video-port N] [--input-port N]
+                       [--no-input] [--width W] [--height H] [--verbose]
 """
 
 import os
 import sys
 import time
-import json
 import socket
 import signal
-import asyncio
 import logging
 import argparse
 import subprocess
 import threading
-from pathlib import Path
-from dataclasses import dataclass, asdict
-from typing import Optional, Callable
+from typing import Optional
 
 import gi
 gi.require_version('Gst', '1.0')
@@ -36,7 +42,7 @@ from gi.repository import Gst, GLib
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-    datefmt='%H:%M:%S'
+    datefmt='%H:%M:%S',
 )
 logger = logging.getLogger('sp7-receiver')
 
@@ -45,268 +51,203 @@ logger = logging.getLogger('sp7-receiver')
 # ---------------------------------------------------------------------------
 SP7_WIDTH = 2736
 SP7_HEIGHT = 1824
-SP7_ASPECT = SP7_WIDTH / SP7_HEIGHT
 
 DEFAULT_VIDEO_PORT = 5004
 DEFAULT_INPUT_PORT = 5005
-DEFAULT_DISCOVERY_PORT = 5353
+CONFIG_PATH = "/etc/sp7-monitor/config.conf"
 
-# GStreamer low-latency pipeline
-# Receives H.264 RTP over UDP, hardware decodes with VAAPI, renders via DRM/KMS
-GST_PIPELINE = (
-    "udpsrc port={video_port} caps=\"application/x-rtp,media=video,encoding-name=H264,payload=96\" ! "
-    "rtpjitterbuffer latency=20 drop-on-latency=true ! "
-    "rtph264depay ! h264parse ! "
-    "vaapih264dec low-latency=1 ! "
-    "videoconvert ! "
-    "videoscale ! "
-    "video/x-raw,width={width},height={height} ! "
-    "kmssink sync=false force-modesetting=true "
-)
+RTP_CAPS = ('application/x-rtp,media=video,encoding-name=H264,'
+            'clock-rate=90000,payload=96')
 
-# Fallback pipeline (no VAAPI) - software decode
-GST_PIPELINE_FALLBACK = (
-    "udpsrc port={video_port} caps=\"application/x-rtp,media=video,encoding-name=H264,payload=96\" ! "
-    "rtpjitterbuffer latency=20 drop-on-latency=true ! "
-    "rtph264depay ! h264parse ! "
-    "avdec_h264 max-threads=4 output-corrupt=false ! "
-    "videoconvert ! "
-    "videoscale ! "
-    "video/x-raw,width={width},height={height} ! "
-    "kmssink sync=false force-modesetting=true "
-)
 
-# X11-based pipeline (for development/testing)
-GST_PIPELINE_X11 = (
-    "udpsrc port={video_port} caps=\"application/x-rtp,media=video,encoding-name=H264,payload=96\" ! "
-    "rtpjitterbuffer latency=20 drop-on-latency=true ! "
-    "rtph264depay ! h264parse ! "
-    "vaapih264dec low-latency=1 ! "
-    "videoconvert ! "
-    "videoscale ! "
-    "video/x-raw,width={width},height={height} ! "
-    "xvimagesink sync=false "
-)
+def load_config(path: str = CONFIG_PATH) -> dict:
+    """Parse the simple key=value config file. Missing file -> empty dict."""
+    cfg: dict = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                key, _, val = line.partition('=')
+                cfg[key.strip()] = val.strip()
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logger.warning(f"Could not read config {path}: {e}")
+    return cfg
 
 
 # ---------------------------------------------------------------------------
-# mDNS Service Discovery
+# mDNS host discovery (best-effort; no interactive prompting)
 # ---------------------------------------------------------------------------
 class HostDiscovery:
     """Discovers SP7 Monitor hosts on the local network via mDNS."""
 
     SERVICE_TYPE = "_sp7monitor._tcp.local."
 
-    def __init__(self):
-        self.hosts: list[dict] = []
-        self._running = False
-
-    def discover(self, timeout: float = 5.0) -> list[dict]:
-        """
-        Discover available hosts via mDNS/DNS-SD.
-        Falls back to Avahi command-line tools if zeroconf is not available.
-        """
-        hosts = []
-
-        # Try avahi-browse (Debian systems)
+    def discover(self, timeout: float = 3.0) -> list:
+        """Return a list of {'address', 'port', 'name'} dicts, or []."""
+        # Prefer avahi-browse if present
         try:
             result = subprocess.run(
-                ['avahi-browse', '-rt', '_sp7monitor._tcp', '-p', '-t'],
-                capture_output=True, text=True, timeout=timeout
+                ['avahi-browse', '-rt', '-p', '_sp7monitor._tcp'],
+                capture_output=True, text=True, timeout=timeout + 2,
             )
             if result.returncode == 0:
-                hosts = self._parse_avahi_output(result.stdout)
+                hosts = self._parse_avahi(result.stdout)
+                if hosts:
+                    return hosts
         except (subprocess.TimeoutExpired, FileNotFoundError):
             pass
-
-        # Fallback: try Python zeroconf
-        if not hosts:
-            try:
-                hosts = self._discover_zeroconf(timeout)
-            except Exception as e:
-                logger.warning(f"zeroconf discovery failed: {e}")
-
-        return hosts
-
-    def _parse_avahi_output(self, output: str) -> list[dict]:
-        """Parse avahi-browse -p output."""
-        hosts = []
-        current = {}
-        for line in output.strip().split('\n'):
-            parts = line.split(';')
-            if len(parts) < 4:
-                continue
-            if parts[0] == '=':
-                iface, proto, name, svc_type, domain, host, addr, port, txt = parts[1:10]
-                hosts.append({
-                    'name': name,
-                    'address': addr,
-                    'host': host.rstrip('.'),
-                    'port': int(port),
-                    'interface': iface,
-                })
-        return hosts
-
-    def _discover_zeroconf(self, timeout: float) -> list[dict]:
-        """Discover using Python zeroconf library."""
+        # Fallback: python-zeroconf
         try:
-            from zeroconf import Zeroconf, ServiceBrowser, ServiceListener
-        except ImportError:
+            return self._discover_zeroconf(timeout)
+        except Exception as e:
+            logger.debug(f"zeroconf discovery unavailable: {e}")
             return []
 
+    @staticmethod
+    def _parse_avahi(output: str) -> list:
+        hosts = []
+        for line in output.strip().splitlines():
+            parts = line.split(';')
+            if len(parts) >= 9 and parts[0] == '=':
+                try:
+                    hosts.append({'name': parts[3], 'address': parts[7],
+                                  'port': int(parts[8])})
+                except (ValueError, IndexError):
+                    continue
+        return hosts
+
+    def _discover_zeroconf(self, timeout: float) -> list:
+        from zeroconf import Zeroconf, ServiceBrowser, ServiceListener
         hosts = []
 
-        class DiscoveryListener(ServiceListener):
+        class _L(ServiceListener):
             def add_service(self, zc, type_, name):
                 info = zc.get_service_info(type_, name)
                 if info and info.addresses:
                     hosts.append({
                         'name': name,
                         'address': socket.inet_ntoa(info.addresses[0]),
-                        'host': info.server.rstrip('.') if info.server else '',
-                        'port': info.port,
+                        'port': info.port or DEFAULT_VIDEO_PORT,
                     })
 
-        zeroconf = Zeroconf()
-        listener = DiscoveryListener()
-        browser = ServiceBrowser(zeroconf, self.SERVICE_TYPE, listener)
+            def update_service(self, *a):
+                pass
+
+            def remove_service(self, *a):
+                pass
+
+        zc = Zeroconf()
+        ServiceBrowser(zc, self.SERVICE_TYPE, _L())
         time.sleep(timeout)
-        zeroconf.close()
+        zc.close()
         return hosts
 
-    def get_host_interactive(self) -> Optional[dict]:
-        """Interactively select a host or enter IP manually."""
-        print("\n" + "=" * 50)
-        print("  SP7 Wireless Monitor - Host Discovery")
-        print("=" * 50)
-
-        hosts = self.discover(timeout=3.0)
-
-        if hosts:
-            print(f"\nFound {len(hosts)} host(s):")
-            for i, h in enumerate(hosts, 1):
-                print(f"  [{i}] {h['name']} at {h['address']}:{h['port']}")
-        else:
-            print("\nNo hosts discovered automatically.")
-
-        print(f"  [0] Enter host IP address manually")
-        print("=" * 50)
-
-        try:
-            choice = input("\nSelect host [0]: ").strip()
-            if not choice:
-                choice = '0'
-            choice = int(choice)
-        except (ValueError, KeyboardInterrupt, EOFError):
-            choice = 0
-
-        if choice == 0:
-            try:
-                ip = input("Enter host IP address: ").strip()
-                port = input(f"Enter video port [{DEFAULT_VIDEO_PORT}]: ").strip()
-                port = int(port) if port else DEFAULT_VIDEO_PORT
-                return {'address': ip, 'port': port, 'name': 'manual'}
-            except (ValueError, KeyboardInterrupt, EOFError):
-                logger.error("Invalid input")
-                return None
-        elif 1 <= choice <= len(hosts):
-            return hosts[choice - 1]
-        else:
-            return None
-
 
 # ---------------------------------------------------------------------------
-# Video Receiver (GStreamer)
+# Video receiver (GStreamer)
 # ---------------------------------------------------------------------------
 class VideoReceiver:
-    """
-    Receives H.264 video stream over UDP/RTP,
-    hardware decodes with VAAPI, renders to display.
-    """
+    """Receives H.264/RTP over UDP, decodes, and renders via DRM/KMS."""
 
-    def __init__(self, host: str, video_port: int, width: int, height: int):
-        self.host = host
+    def __init__(self, video_port: int, width: int, height: int):
         self.video_port = video_port
         self.width = width
         self.height = height
         self.pipeline: Optional[Gst.Pipeline] = None
         self.loop: Optional[GLib.MainLoop] = None
+        self._loop_thread: Optional[threading.Thread] = None
         self._running = False
+        self._need_restart = False
 
-    def build_pipeline(self, try_hardware: bool = True) -> Gst.Pipeline:
-        """Build the GStreamer pipeline."""
-        format_args = {
-            'video_port': self.video_port,
-            'width': self.width,
-            'height': self.height,
-        }
+    @staticmethod
+    def _pick_decoder() -> str:
+        """Choose the best available H.264 decoder element."""
+        for dec in ('vah264dec', 'vaapih264dec'):
+            if Gst.ElementFactory.find(dec):
+                logger.info(f"Using hardware H.264 decoder: {dec}")
+                return f"{dec} ! "
+        logger.warning("No VA-API decoder found — using software avdec_h264")
+        return "avdec_h264 max-threads=4 ! "
 
-        # Try VAAPI hardware decode first
-        if try_hardware:
-            pipeline_str = GST_PIPELINE.format(**format_args)
-            logger.info("Using VAAPI hardware decode pipeline")
-        else:
-            pipeline_str = GST_PIPELINE_FALLBACK.format(**format_args)
-            logger.info("Using software decode fallback pipeline")
+    @staticmethod
+    def _pick_sink() -> str:
+        """Choose the display sink. kmssink renders directly via DRM/KMS."""
+        if Gst.ElementFactory.find('kmssink'):
+            return "kmssink sync=false force-modesetting=true"
+        logger.warning("kmssink not found — falling back to autovideosink")
+        return "autovideosink sync=false"
 
-        pipeline = Gst.parse_launch(pipeline_str)
-        if not pipeline:
-            raise RuntimeError("Failed to create GStreamer pipeline")
-
-        # Add bus watch for errors
+    def _build_pipeline(self) -> Gst.Pipeline:
+        desc = (
+            f'udpsrc port={self.video_port} caps="{RTP_CAPS}" ! '
+            'rtpjitterbuffer latency=30 drop-on-latency=true ! '
+            'rtph264depay ! h264parse ! '
+            + self._pick_decoder() +
+            'videoconvert ! videoscale ! '
+            f'video/x-raw,width={self.width},height={self.height} ! '
+            + self._pick_sink()
+        )
+        logger.info(f"Pipeline: {desc}")
+        pipeline = Gst.parse_launch(desc)
         bus = pipeline.get_bus()
         bus.add_signal_watch()
         bus.connect("message", self._on_bus_message)
-
         return pipeline
 
     def _on_bus_message(self, bus, message):
-        """Handle GStreamer bus messages."""
         t = message.type
-        if t == Gst.MessageType.EOS:
-            logger.info("End of stream")
-            self._running = False
-        elif t == Gst.MessageType.ERROR:
+        if t == Gst.MessageType.ERROR:
             err, debug = message.parse_error()
-            logger.error(f"GStreamer error: {err.message}")
-            if debug:
-                logger.debug(f"Debug: {debug}")
-            self._running = False
+            logger.error(f"GStreamer error: {err.message} ({debug})")
+            self._need_restart = True   # manager thread will rebuild
         elif t == Gst.MessageType.WARNING:
-            warn, debug = message.parse_warning()
+            warn, _ = message.parse_warning()
             logger.warning(f"GStreamer warning: {warn.message}")
-        elif t == Gst.MessageType.STATE_CHANGED:
-            if message.src == self.pipeline:
-                old_state, new_state, pending = message.parse_state_changed()
-                logger.debug(f"Pipeline state: {old_state.value_nick} -> {new_state.value_nick}")
+        elif t == Gst.MessageType.STATE_CHANGED and message.src == self.pipeline:
+            old, new, _ = message.parse_state_changed()
+            if new == Gst.State.PLAYING:
+                logger.info("Video pipeline is PLAYING — listening for stream "
+                            f"on UDP :{self.video_port}")
+
+    def _manager(self) -> None:
+        """Owns the pipeline lifecycle: brings it up and rebuilds it on
+        failure. A transient failure (e.g. DRM contention) never kills the
+        receiver — it just retries until the pipeline holds."""
+        while self._running:
+            if self._need_restart or self.pipeline is None:
+                self._need_restart = False
+                try:
+                    if self.pipeline is not None:
+                        self.pipeline.set_state(Gst.State.NULL)
+                        time.sleep(2)
+                    self.pipeline = self._build_pipeline()
+                    ret = self.pipeline.set_state(Gst.State.PLAYING)
+                    if ret == Gst.StateChangeReturn.FAILURE:
+                        logger.warning("Pipeline set_state FAILURE — retry in 5s")
+                        self._need_restart = True
+                        time.sleep(5)
+                    else:
+                        logger.info(f"Pipeline bring-up: {ret.value_nick}")
+                except Exception as e:
+                    logger.error(f"Pipeline bring-up error: {e} — retry in 5s")
+                    self._need_restart = True
+                    time.sleep(5)
+            time.sleep(1)
 
     def start(self) -> None:
-        """Start video reception."""
         Gst.init(None)
-
-        # First try: VAAPI hardware decode
-        try:
-            self.pipeline = self.build_pipeline(try_hardware=True)
-        except Exception as e:
-            logger.warning(f"VAAPI pipeline failed: {e}, trying software fallback")
-            self.pipeline = self.build_pipeline(try_hardware=False)
-
-        # Set pipeline to playing
-        ret = self.pipeline.set_state(Gst.State.PLAYING)
-        if ret == Gst.StateChangeReturn.FAILURE:
-            raise RuntimeError("Failed to start pipeline")
-
         self._running = True
-        logger.info(f"Video receiver started on port {self.video_port}")
-        logger.info(f"Waiting for stream from {self.host}...")
-
-        # Run GLib main loop in background thread
         self.loop = GLib.MainLoop()
         self._loop_thread = threading.Thread(target=self.loop.run, daemon=True)
         self._loop_thread.start()
+        threading.Thread(target=self._manager, daemon=True).start()
+        logger.info(f"Video receiver starting (UDP :{self.video_port})")
 
     def stop(self) -> None:
-        """Stop video reception."""
         self._running = False
         if self.loop:
             self.loop.quit()
@@ -314,19 +255,14 @@ class VideoReceiver:
             self.pipeline.set_state(Gst.State.NULL)
         logger.info("Video receiver stopped")
 
-    @property
-    def is_running(self) -> bool:
-        return self._running
-
 
 # ---------------------------------------------------------------------------
-# Input Forwarder (evdev capture -> network)
+# Input forwarder (evdev capture -> network)
 # ---------------------------------------------------------------------------
 class InputForwarder:
-    """
-    Captures touch/pen events from Surface Pro 7 digitizer
-    and forwards them to the host PC.
-    """
+    """Captures the Surface digitizer and forwards events to the host."""
+
+    SEND_HZ = 120
 
     def __init__(self, host: str, input_port: int):
         self.host = host
@@ -335,311 +271,184 @@ class InputForwarder:
         self._thread: Optional[threading.Thread] = None
         self._socket: Optional[socket.socket] = None
 
-    def _find_input_device(self) -> Optional[str]:
-        """Find the Surface pen/touch input device."""
+    @staticmethod
+    def _find_input_device() -> Optional[str]:
         try:
             import evdev
         except ImportError:
-            logger.error("python-evdev not installed")
+            logger.error("python-evdev not installed — input disabled")
             return None
-
-        # Look for Surface-specific devices
-        for path in evdev.list_devices():
-            try:
-                dev = evdev.InputDevice(path)
-                name_lower = dev.name.lower()
-                if any(k in name_lower for k in ['ipts', 'pen', 'touch', 'stylus', 'surface']):
-                    caps = dev.capabilities()
-                    # Check for absolute positioning (digitizer)
-                    if evdev.ecodes.EV_ABS in caps:
-                        logger.info(f"Found input device: {dev.name} at {path}")
-                        return path
-            except (PermissionError, OSError):
-                continue
-
-        # Fallback: any device with ABS_X/ABS_Y
+        candidates = []
         for path in evdev.list_devices():
             try:
                 dev = evdev.InputDevice(path)
                 caps = dev.capabilities()
-                if evdev.ecodes.EV_ABS in caps:
-                    abs_caps = caps[evdev.ecodes.EV_ABS]
-                    if (evdev.ecodes.ABS_X in abs_caps and
-                        evdev.ecodes.ABS_Y in abs_caps):
-                        logger.info(f"Found input device (fallback): {dev.name} at {path}")
-                        return path
+                if evdev.ecodes.EV_ABS not in caps:
+                    continue
+                abs_codes = dict(caps[evdev.ecodes.EV_ABS])
+                if (evdev.ecodes.ABS_X in abs_codes
+                        and evdev.ecodes.ABS_Y in abs_codes):
+                    name = dev.name.lower()
+                    # Prefer the cooked iptsd virtual *pen*; the raw
+                    # "Intel Touch Host Controller" is not what we want.
+                    if 'host controller' in name:
+                        score = 1
+                    elif 'stylus' in name or 'pen' in name:
+                        score = 4
+                    elif 'iptsd' in name or 'touchscreen' in name:
+                        score = 3
+                    elif any(k in name for k in ('touch', 'surface',
+                                                 'digitizer')):
+                        score = 2
+                    else:
+                        score = 0
+                    candidates.append((score, path, dev.name))
             except (PermissionError, OSError):
                 continue
-
-        logger.warning("No suitable input device found")
-        return None
+        if not candidates:
+            logger.warning("No digitizer / touch device found")
+            return None
+        candidates.sort(reverse=True)
+        _, path, name = candidates[0]
+        logger.info(f"Input device: {name} ({path})")
+        return path
 
     def _capture_loop(self, device_path: str) -> None:
-        """Main capture and forward loop."""
-        try:
-            import evdev
-            import msgpack
-        except ImportError as e:
-            logger.error(f"Missing dependency: {e}")
-            return
-
+        import evdev
+        import msgpack
         try:
             device = evdev.InputDevice(device_path)
-            device.grab()  # Exclusive access
-            logger.info(f"Grabbed input device: {device.name}")
         except Exception as e:
-            logger.error(f"Failed to grab device: {e}")
+            logger.error(f"Cannot open input device: {e}")
             return
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        logger.info(f"Forwarding input to {self.host}:{self.input_port}")
 
-        # Connect to host
-        try:
-            self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self._socket.settimeout(2.0)
-            logger.info(f"Input forwarding to {self.host}:{self.input_port}")
-        except Exception as e:
-            logger.error(f"Failed to create socket: {e}")
-            return
-
-        # Get device capabilities for coordinate mapping
         absinfo = {}
-        caps = device.capabilities()
-        if evdev.ecodes.EV_ABS in caps:
-            for code, info in caps[evdev.ecodes.EV_ABS]:
-                absinfo[code] = {
-                    'min': info.min,
-                    'max': info.max,
-                    'res': info.resolution if hasattr(info, 'resolution') else None,
-                }
+        for code, info in device.capabilities().get(evdev.ecodes.EV_ABS, []):
+            absinfo[code] = (info.min, info.max)
 
-        # Normalize and forward events
-        pen_state = {
-            'x': 0.0, 'y': 0.0,
-            'pressure': 0.0,
-            'tilt_x': 0.0, 'tilt_y': 0.0,
-            'buttons': 0,
-            'in_range': False,
-            'touching': False,
-        }
+        state = {'x': 0.0, 'y': 0.0, 'p': 0.0, 'tx': 0.0, 'ty': 0.0,
+                 'tip': False, 'rng': False, 'btn': 0}
+        interval = 1.0 / self.SEND_HZ
+        last = 0.0
 
-        last_send_time = 0
-        SEND_INTERVAL = 1.0 / 120  # 120 Hz max send rate
+        def norm(v, code, lo=0.0, hi=1.0):
+            if code not in absinfo:
+                return 0.0
+            amin, amax = absinfo[code]
+            if amax <= amin:
+                return 0.0
+            return max(lo, min(hi, lo + (v - amin) / (amax - amin) * (hi - lo)))
 
         while self._running:
             try:
-                # Read events with timeout
-                events = device.read_one()
-                if events is None:
+                ev = device.read_one()
+                if ev is None:
                     time.sleep(0.001)
-                    continue
-
-                # Process event
-                self._process_event(events, pen_state, absinfo)
-
-                # Send at throttled rate
+                else:
+                    if ev.type == evdev.ecodes.EV_ABS:
+                        if ev.code == evdev.ecodes.ABS_X:
+                            state['x'] = norm(ev.value, ev.code)
+                        elif ev.code == evdev.ecodes.ABS_Y:
+                            state['y'] = norm(ev.value, ev.code)
+                        elif ev.code == evdev.ecodes.ABS_PRESSURE:
+                            state['p'] = norm(ev.value, ev.code)
+                        elif ev.code == evdev.ecodes.ABS_TILT_X:
+                            state['tx'] = norm(ev.value, ev.code, -1.0, 1.0)
+                        elif ev.code == evdev.ecodes.ABS_TILT_Y:
+                            state['ty'] = norm(ev.value, ev.code, -1.0, 1.0)
+                    elif ev.type == evdev.ecodes.EV_KEY:
+                        if ev.code == evdev.ecodes.BTN_TOUCH:
+                            state['tip'] = bool(ev.value)
+                        elif ev.code == evdev.ecodes.BTN_TOOL_PEN:
+                            state['rng'] = bool(ev.value)
+                        elif ev.code == evdev.ecodes.BTN_STYLUS:
+                            state['btn'] = 1 if ev.value else 0
                 now = time.time()
-                if now - last_send_time >= SEND_INTERVAL:
-                    packet = self._build_packet(pen_state)
-                    data = msgpack.packb(packet, use_bin_type=True)
-                    self._socket.sendto(data, (self.host, self.input_port))
-                    last_send_time = now
-
+                if now - last >= interval:
+                    pkt = msgpack.packb({'t': now, **state}, use_bin_type=True)
+                    self._socket.sendto(pkt, (self.host, self.input_port))
+                    last = now
             except OSError as e:
                 if self._running:
-                    logger.error(f"Socket error: {e}")
-                break
+                    logger.error(f"Input socket error: {e}")
+                time.sleep(0.5)
             except Exception as e:
                 logger.error(f"Input capture error: {e}")
                 time.sleep(0.1)
-
-        try:
-            device.ungrab()
-        except:
-            pass
         logger.info("Input forwarder stopped")
 
-    def _process_event(self, event, state: dict, absinfo: dict) -> None:
-        """Process a single evdev event."""
-        import evdev
-
-        if event.type == evdev.ecodes.EV_ABS:
-            if event.code == evdev.ecodes.ABS_X:
-                state['x'] = self._normalize(event.value, absinfo.get(evdev.ecodes.ABS_X, {}))
-            elif event.code == evdev.ecodes.ABS_Y:
-                state['y'] = self._normalize(event.value, absinfo.get(evdev.ecodes.ABS_Y, {}))
-            elif event.code == evdev.ecodes.ABS_PRESSURE:
-                state['pressure'] = self._normalize(event.value, absinfo.get(evdev.ecodes.ABS_PRESSURE, {}))
-            elif event.code == evdev.ecodes.ABS_TILT_X:
-                state['tilt_x'] = self._normalize_tilt(event.value, absinfo.get(evdev.ecodes.ABS_TILT_X, {}))
-            elif event.code == evdev.ecodes.ABS_TILT_Y:
-                state['tilt_y'] = self._normalize_tilt(event.value, absinfo.get(evdev.ecodes.ABS_TILT_Y, {}))
-
-        elif event.type == evdev.ecodes.EV_KEY:
-            if event.code == evdev.ecodes.BTN_TOUCH:
-                state['touching'] = bool(event.value)
-            elif event.code == evdev.ecodes.BTN_TOOL_PEN:
-                state['in_range'] = bool(event.value)
-            elif event.code == evdev.ecodes.BTN_TOOL_RUBBER:
-                state['buttons'] = 1 if event.value else 0
-
-    def _normalize(self, value: int, info: dict) -> float:
-        """Normalize to [0, 1] range."""
-        min_val = info.get('min', 0)
-        max_val = info.get('max', 1)
-        if max_val <= min_val:
-            return 0.0
-        return max(0.0, min(1.0, (value - min_val) / (max_val - min_val)))
-
-    def _normalize_tilt(self, value: int, info: dict) -> float:
-        """Normalize tilt to [-1, 1] range."""
-        min_val = info.get('min', -90)
-        max_val = info.get('max', 90)
-        if max_val <= min_val:
-            return 0.0
-        return max(-1.0, min(1.0, 2.0 * (value - min_val) / (max_val - min_val) - 1.0))
-
-    def _build_packet(self, state: dict) -> dict:
-        """Build network packet from pen state."""
-        return {
-            't': time.time(),
-            'x': state['x'],
-            'y': state['y'],
-            'p': round(state['pressure'], 4),
-            'tx': round(state['tilt_x'], 4),
-            'ty': round(state['tilt_y'], 4),
-            'tip': state['touching'],
-            'rng': state['in_range'],
-            'btn': state['buttons'],
-        }
-
-    def start(self) -> None:
-        """Start input capture and forwarding."""
-        self._running = True
-
+    def start(self) -> bool:
         device_path = self._find_input_device()
         if not device_path:
-            logger.error("No input device found, input forwarding disabled")
-            return
-
+            return False
+        self._running = True
         self._thread = threading.Thread(
-            target=self._capture_loop,
-            args=(device_path,),
-            daemon=True
-        )
+            target=self._capture_loop, args=(device_path,), daemon=True)
         self._thread.start()
-        logger.info("Input forwarder started")
+        return True
 
     def stop(self) -> None:
-        """Stop input forwarding."""
         self._running = False
         if self._socket:
             try:
                 self._socket.close()
-            except:
+            except Exception:
                 pass
-        if self._thread:
-            self._thread.join(timeout=2.0)
-        logger.info("Input forwarder stopped")
 
 
 # ---------------------------------------------------------------------------
-# Main Receiver
+# Main receiver
 # ---------------------------------------------------------------------------
 class SP7Receiver:
-    """
-    Main SP7 Wireless Monitor receiver.
-    Coordinates video reception and input forwarding.
-    """
-
-    def __init__(self, host: str, video_port: int, input_port: int):
+    def __init__(self, host: Optional[str], video_port: int,
+                 input_port: int, enable_input: bool = True):
         self.host = host
         self.video_port = video_port
         self.input_port = input_port
-
+        self.enable_input = enable_input
         self.video: Optional[VideoReceiver] = None
         self.input_fwd: Optional[InputForwarder] = None
-        self._shutdown_event = threading.Event()
-
-    def setup_display(self) -> None:
-        """Configure display for optimal performance."""
-        logger.info("Configuring display...")
-
-        # Disable screen blanking and DPMS
-        for cmd in [
-            ['xset', 's', 'off'],
-            ['xset', '-dpms'],
-            ['xset', 's', 'noblank'],
-        ]:
-            try:
-                subprocess.run(cmd, capture_output=True, timeout=5)
-            except:
-                pass
-
-        # Try to set native resolution via KMS/DRM
-        try:
-            result = subprocess.run(
-                ['xrandr'], capture_output=True, text=True, timeout=5
-            )
-            if result.returncode == 0 and 'connected' in result.stdout:
-                logger.info("Display connected via X11/KMS")
-        except:
-            pass
+        self._shutdown = threading.Event()
 
     def start(self) -> None:
-        """Start all receiver components."""
-        logger.info("=" * 50)
-        logger.info("  SP7 Wireless Monitor Receiver Starting")
-        logger.info("=" * 50)
-        logger.info(f"Host: {self.host}")
-        logger.info(f"Video port: {self.video_port}")
-        logger.info(f"Input port: {self.input_port}")
+        logger.info("=" * 52)
+        logger.info("  SP7 Wireless Monitor Receiver")
+        logger.info(f"  video :{self.video_port}  input :{self.input_port}  "
+                    f"host: {self.host or '(none — video only)'}")
+        logger.info("=" * 52)
 
-        # Setup display
-        self.setup_display()
+        # Video always starts — it just listens on a UDP port.
+        self.video = VideoReceiver(self.video_port, SP7_WIDTH, SP7_HEIGHT)
+        self.video.start()
 
-        # Start video receiver
-        self.video = VideoReceiver(
-            self.host, self.video_port, SP7_WIDTH, SP7_HEIGHT
-        )
-        try:
-            self.video.start()
-        except Exception as e:
-            logger.error(f"Failed to start video receiver: {e}")
-            raise
-
-        # Start input forwarding
-        self.input_fwd = InputForwarder(self.host, self.input_port)
-        self.input_fwd.start()
-
-        logger.info("=" * 50)
-        logger.info("  Receiver running. Press Ctrl+C to stop.")
-        logger.info("=" * 50)
+        # Input forwarding needs a host to send to.
+        if self.enable_input and self.host:
+            self.input_fwd = InputForwarder(self.host, self.input_port)
+            if not self.input_fwd.start():
+                logger.warning("Input forwarding could not start")
+        elif not self.host:
+            logger.info("Input forwarding idle — no host set. Add 'host=<ip>' "
+                        "to /etc/sp7-monitor/config.conf and restart.")
 
     def stop(self) -> None:
-        """Stop all components gracefully."""
         logger.info("Shutting down receiver...")
-        self._shutdown_event.set()
+        self._shutdown.set()
         if self.input_fwd:
             self.input_fwd.stop()
         if self.video:
             self.video.stop()
-        logger.info("Receiver stopped")
 
     def run(self) -> None:
-        """Main run loop."""
         try:
             self.start()
-            # Wait for shutdown signal
-            while not self._shutdown_event.is_set():
-                if self.video and not self.video.is_running:
-                    logger.warning("Video stream ended, restarting in 3s...")
-                    time.sleep(3)
-                    try:
-                        self.video.start()
-                    except Exception as e:
-                        logger.error(f"Restart failed: {e}")
-                self._shutdown_event.wait(1.0)
+            # Stay alive. The video pipeline self-recovers on errors;
+            # the receiver never exits on its own.
+            while not self._shutdown.is_set():
+                self._shutdown.wait(2.0)
         except KeyboardInterrupt:
-            logger.info("Interrupted by user")
+            pass
         finally:
             self.stop()
 
@@ -647,61 +456,48 @@ class SP7Receiver:
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-def main():
-    parser = argparse.ArgumentParser(
-        description='SP7 Wireless Monitor Receiver',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  %(prog)s                           # Auto-discover host
-  %(prog)s --host 192.168.1.100      # Direct connect to host
-  %(prog)s --host 192.168.1.100 --video-port 5004 --input-port 5005
-        """
-    )
-    parser.add_argument('--host', help='Host PC IP address (auto-discover if omitted)')
-    parser.add_argument('--video-port', type=int, default=DEFAULT_VIDEO_PORT,
-                        help=f'Video RTP port (default: {DEFAULT_VIDEO_PORT})')
-    parser.add_argument('--input-port', type=int, default=DEFAULT_INPUT_PORT,
-                        help=f'Input UDP port (default: {DEFAULT_INPUT_PORT})')
+def main() -> None:
+    parser = argparse.ArgumentParser(description='SP7 Wireless Monitor Receiver')
+    parser.add_argument('--host', help='Host PC IP (for input forwarding)')
+    parser.add_argument('--video-port', type=int)
+    parser.add_argument('--input-port', type=int)
+    parser.add_argument('--width', type=int)
+    parser.add_argument('--height', type=int)
     parser.add_argument('--no-input', action='store_true',
-                        help='Disable input forwarding')
-    parser.add_argument('--verbose', '-v', action='store_true',
-                        help='Enable verbose logging')
-    parser.add_argument('--width', type=int, default=SP7_WIDTH,
-                        help=f'Display width (default: {SP7_WIDTH})')
-    parser.add_argument('--height', type=int, default=SP7_HEIGHT,
-                        help=f'Display height (default: {SP7_HEIGHT})')
-
+                        help='Disable input forwarding (video only)')
+    parser.add_argument('--verbose', '-v', action='store_true')
     args = parser.parse_args()
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    # Determine host
-    host = args.host
-    if not host:
-        discovery = HostDiscovery()
-        result = discovery.get_host_interactive()
-        if result:
-            host = result['address']
-            if 'port' in result and result['port'] != DEFAULT_VIDEO_PORT:
-                args.video_port = result['port']
-        if not host:
-            print("No host selected. Exiting.")
-            sys.exit(1)
+    cfg = load_config()
 
-    # Update SP7 dimensions if overridden
+    video_port = args.video_port or int(cfg.get('video_port', DEFAULT_VIDEO_PORT))
+    input_port = args.input_port or int(cfg.get('input_port', DEFAULT_INPUT_PORT))
+
     global SP7_WIDTH, SP7_HEIGHT
-    SP7_WIDTH = args.width
-    SP7_HEIGHT = args.height
+    if args.width:
+        SP7_WIDTH = args.width
+    if args.height:
+        SP7_HEIGHT = args.height
 
-    # Create and run receiver
-    receiver = SP7Receiver(host, args.video_port, args.input_port)
+    # Resolve host for input forwarding: --host, then config, then mDNS.
+    host = args.host or (cfg.get('host') or None)
+    if not host:
+        try:
+            found = HostDiscovery().discover(timeout=3.0)
+            if found:
+                host = found[0]['address']
+                logger.info(f"Auto-discovered host: {host}")
+        except Exception as e:
+            logger.warning(f"Host discovery failed: {e}")
 
-    # Handle signals
-    signal.signal(signal.SIGINT, lambda s, f: receiver.stop())
-    signal.signal(signal.SIGTERM, lambda s, f: receiver.stop())
+    enable_input = not args.no_input
 
+    receiver = SP7Receiver(host, video_port, input_port, enable_input)
+    signal.signal(signal.SIGINT, lambda *_: receiver.stop())
+    signal.signal(signal.SIGTERM, lambda *_: receiver.stop())
     receiver.run()
 
 

@@ -1,41 +1,41 @@
 [Unit]
 Description=SP7 Wireless Monitor Receiver
-Documentation=https://github.com/sp7-wireless-monitor
-After=network-online.target iptsd.service systemd-user-sessions.service
-Wants=network-online.target iptsd.service
+Documentation=https://github.com/AndreNijman/surface-wireless-monitor
+# Network is only needed to forward input back to the host; the video
+# path just listens on a UDP port, so this is a soft (Wants) dependency.
+Wants=network-online.target
+After=network-online.target
+# Restart rate-limit (these belong in [Unit] for current systemd).
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
 User=root
-Environment="DISPLAY=:0"
-Environment="XAUTHORITY=/home/monitor/.Xauthority"
-Environment="GST_DEBUG=1"
-Environment="GST_DEBUG_NO_COLOR=1"
 Environment="PYTHONUNBUFFERED=1"
+Environment="GST_DEBUG=1"
 
-# Start the receiver
-ExecStartPre=/bin/bash -c 'modprobe intel_ipts 2>/dev/null || true; modprobe ithc 2>/dev/null || true'
-ExecStartPre=/bin/bash -c 'for i in $(iw dev 2>/dev/null | grep Interface | awk "{print \$2}"); do iw dev "$i" set power_save off 2>/dev/null || true; done'
+# Surface digitizer modules + disable Wi-Fi power save for low latency.
+ExecStartPre=-/bin/bash -c 'modprobe intel_ipts 2>/dev/null; modprobe ithc 2>/dev/null; true'
+ExecStartPre=-/bin/bash -c 'for i in $(iw dev 2>/dev/null | awk "/Interface/{print \$2}"); do iw dev "$i" set power_save off 2>/dev/null || true; done'
+
+# The receiver reads /etc/sp7-monitor/config.conf itself.
 ExecStart=/usr/local/bin/sp7-receiver.py --verbose
 
-# Restart policy
-Restart=always
-RestartSec=3
-StartLimitInterval=30
-StartLimitBurst=5
+# The receiver runs indefinitely; only restart it if it genuinely dies.
+Restart=on-failure
+RestartSec=5
 
-# Logging
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=sp7-monitor
 
-# Security (minimal - we need hardware access)
-PrivateTmp=yes
+# Needs raw hardware access (DRM/KMS display + input devices). Run
+# unconfined: a DeviceAllow= list turns on the device cgroup whitelist,
+# and a non-matching pattern then BLOCKS /dev/dri, so kmssink cannot open
+# the DRM device. No DeviceAllow = full device access (this runs as root).
 ProtectSystem=no
 ProtectHome=no
-DeviceAllow=/dev/input/* rw
-DeviceAllow=/dev/dri/* rw
-DeviceAllow=/dev/video* rw
 
 [Install]
-WantedBy=graphical.target
+WantedBy=multi-user.target
