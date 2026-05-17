@@ -280,6 +280,18 @@ chroot "${CHROOT_DIR}" apt-get clean
 chroot "${CHROOT_DIR}" rm -rf /var/cache/apt/archives/* /var/lib/apt/lists/* /tmp/* /var/tmp/*
 find "${CHROOT_DIR}/var/log" -type f -delete 2>/dev/null || true
 
+# Unmount the chroot pseudo-filesystems BEFORE squashing. Otherwise mksquashfs
+# descends into the bind-mounted /proc, /sys, /dev and tries to archive virtual
+# files such as /proc/kcore (sized to the whole address space) — a runaway that
+# fills the disk and never completes. After unmounting, these are plain empty
+# mount-point directories and get archived correctly.
+info "Unmounting chroot pseudo-filesystems before squashfs..."
+umount -lf "${CHROOT_DIR}/dev/pts" 2>/dev/null || true
+umount -lf "${CHROOT_DIR}/dev"     2>/dev/null || true
+umount -lf "${CHROOT_DIR}/proc"    2>/dev/null || true
+umount -lf "${CHROOT_DIR}/sys"     2>/dev/null || true
+umount -lf "${CHROOT_DIR}/run"     2>/dev/null || true
+
 # Build squashfs
 mksquashfs "${CHROOT_DIR}" "${ISO_DIR}/live/filesystem.squashfs" \
     -comp xz \

@@ -419,6 +419,7 @@ onward each change is a git commit.
 | **v8** | Removed the VA-API driver variants `i965-va-driver-shaders` and `intel-media-va-driver-non-free` from the debootstrap include list — they `Conflict` with the standard drivers pulled in by `va-driver-all`, and debootstrap's raw `dpkg` cannot resolve that the way `apt` can. |
 | **v9** | Pre-load Wi-Fi and SSH: added `network-manager` and `openssh-server`, dropped `dhcpcd5`; the build now overlays a git-ignored `overlay-local/` tree carrying NetworkManager connections and `authorized_keys`, and enables the `NetworkManager` and `ssh` services. |
 | **v10** | Fixed the linux-surface signing-key fetch: the old `surface-archive-keyring.gpg` path now 404s. Switched to the current `pkg/keys/surface.asc` (ASCII-armored) and pointed apt's `signed-by=` straight at the `.asc` (supported in bookworm — no `gpg --dearmor` step needed). |
+| **v11** | Unmount the chroot's `/proc`, `/sys`, `/dev`, `/run` bind mounts before `mksquashfs`. Otherwise `mksquashfs` descended into the mounted `/proc` and tried to archive `/proc/kcore` — a virtual file the size of the machine's address space — producing a runaway squashfs that filled the disk and never completed. |
 
 ---
 
