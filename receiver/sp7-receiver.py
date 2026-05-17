@@ -181,14 +181,24 @@ class VideoReceiver:
 
     @staticmethod
     def _pick_sink() -> str:
-        """Choose the display sink. kmssink renders directly via DRM/KMS and
-        scales the frame to the panel with the display controller's hardware
-        scaler (can-scale=true) — no per-frame software scaling."""
+        """Choose the display sink. kmssink renders directly via DRM/KMS."""
         if Gst.ElementFactory.find('kmssink'):
-            return ("kmssink sync=false force-modesetting=true "
-                    "can-scale=true")
+            return "kmssink sync=false force-modesetting=true"
         logger.warning("kmssink not found — falling back to autovideosink")
         return "autovideosink sync=false"
+
+    def _pick_scaler(self) -> str:
+        """Scale the decoded frame up to the panel resolution. kmssink does
+        NOT scale on this hardware — the frame handed to it must already be
+        the panel size. vapostproc does the scale on the iGPU (VA-API), which
+        costs almost no CPU; software videoscale (the fallback) was the
+        receiver's CPU bottleneck — it caused the latency and glitches."""
+        size = f"video/x-raw,width={self.width},height={self.height}"
+        if Gst.ElementFactory.find('vapostproc'):
+            logger.info("Scaling via vapostproc (VA-API hardware scaler)")
+            return f"videoconvert ! vapostproc ! {size} ! "
+        logger.warning("vapostproc not found — using software videoscale")
+        return f"videoconvert ! videoscale ! {size} ! "
 
     def _build_pipeline(self) -> Gst.Pipeline:
         desc = (
@@ -209,11 +219,11 @@ class VideoReceiver:
             # leaking encoded frames would corrupt the stream.
             'queue leaky=downstream max-size-buffers=3 max-size-time=0 '
             'max-size-bytes=0 ! '
-            'videoconvert ! '
-            # No software videoscale — kmssink hardware-scales to the panel.
-            # Software upscaling every frame to 2736x1824 was the receiver's
-            # CPU bottleneck: it starved the decoder, overflowed the UDP
-            # socket and accumulated latency.
+            # Hardware (VA-API) upscale to the panel resolution — software
+            # upscaling every frame to 2736x1824 was the receiver's CPU
+            # bottleneck: it starved the decoder, overflowed the UDP socket
+            # (glitches) and accumulated latency.
+            + self._pick_scaler()
             + self._pick_sink()
         )
         logger.info(f"Pipeline: {desc}")
