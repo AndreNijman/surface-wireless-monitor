@@ -71,8 +71,8 @@ def detect_capture_source() -> str:
     """Best-effort default capture source. --source overrides this."""
     session = os.environ.get('XDG_SESSION_TYPE', '')
     if session == 'wayland':
-        logger.info("Wayland session — capturing via xdg-desktop-portal")
-        return 'portal'
+        logger.info("Wayland session — capturing via wf-recorder (wlr-screencopy)")
+        return 'wfrecorder'
     if _have('ximagesrc'):
         disp = os.environ.get('DISPLAY', ':0')
         logger.info(f"X11 capture via ximagesrc (display {disp})")
@@ -109,6 +109,67 @@ def build_capture_pipeline(source: str, fps: int, bitrate: int,
     logger.info(f"Encoder: {enc}")
     logger.info(f"Pipeline: {pipeline}")
     return pipeline
+
+
+# ---------------------------------------------------------------------------
+# Wayland capture via wf-recorder (wlr-screencopy, portal-independent)
+# ---------------------------------------------------------------------------
+class WfRecorderCapture:
+    """Captures the Hyprland/wlroots desktop with wf-recorder into a fifo,
+    exposed to GStreamer as an `fdsrc`. Raw frames (single hardware encode
+    downstream); -D forces continuous frames regardless of screen damage."""
+
+    def __init__(self):
+        self.proc = None
+        self.fifo = None
+        self.fd = None
+
+    def start(self) -> str:
+        import json
+        import tempfile
+        mons = json.loads(subprocess.run(
+            ['hyprctl', '-j', 'monitors'],
+            capture_output=True, text=True, timeout=5).stdout)
+        m = mons[0]
+        out, w, h = m['name'], int(m['width']), int(m['height'])
+        rate = max(1, round(float(m.get('refreshRate', 60))))
+        self.fifo = tempfile.mktemp(prefix='sp7cap-', suffix='.y4m')
+        os.mkfifo(self.fifo)
+        logger.info(f"wf-recorder: capturing {out} {w}x{h}@{rate}")
+        self.proc = subprocess.Popen(
+            ['wf-recorder', '-o', out, '-c', 'rawvideo', '-x', 'yuv420p',
+             '--muxer=yuv4mpegpipe', '-D', '-y', '-f', self.fifo],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(1.5)  # let wf-recorder open the fifo's write end
+        if self.proc.poll() is not None:
+            raise RuntimeError("wf-recorder exited immediately "
+                               "(is it installed? is the output name right?)")
+        self.fd = os.open(self.fifo, os.O_RDONLY)
+        # capssetter relabels y4mdec's bogus avformat framerate to the real
+        # rate (videorate would otherwise stall trying to drop 90000fps).
+        return (f'fdsrc fd={self.fd} ! y4mdec ! capssetter replace=true '
+                f'caps="video/x-raw,format=I420,width={w},height={h},'
+                f'framerate={rate}/1,interlace-mode=progressive,'
+                f'pixel-aspect-ratio=1/1" ! videoconvert')
+
+    def stop(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=3)
+            except Exception:
+                self.proc.kill()
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except Exception:
+                pass
+        if self.fifo and os.path.exists(self.fifo):
+            try:
+                os.unlink(self.fifo)
+            except Exception:
+                pass
+        logger.info("wf-recorder capture stopped")
 
 
 # ---------------------------------------------------------------------------
@@ -327,6 +388,7 @@ class HostServer:
         self.streamer = None
         self.input_server = None
         self.advertiser = None
+        self.capture = None
         self._stop = threading.Event()
 
     def start(self):
@@ -354,6 +416,8 @@ class HostServer:
             self.input_server.stop()
         if self.advertiser:
             self.advertiser.stop()
+        if self.capture:
+            self.capture.stop()
 
     def run(self):
         try:
@@ -389,7 +453,17 @@ def main():
 
     Gst.init(None)
     source = args.source or detect_capture_source()
-    if source == 'portal':
+    capture = None
+    if source == 'wfrecorder':
+        try:
+            capture = WfRecorderCapture()
+            source = capture.start()
+            logger.info(f"Capture source: {source}")
+        except Exception as e:
+            logger.error(f"wf-recorder capture failed: {e}")
+            logger.error("Falling back to a test pattern (pass --source to override)")
+            source = 'videotestsrc is-live=true pattern=ball'
+    elif source == 'portal':
         logger.info("Opening Wayland desktop capture via xdg-desktop-portal...")
         try:
             sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -404,6 +478,7 @@ def main():
 
     server = HostServer(args.target, args.video_port, args.input_port,
                         source, args.fps, args.bitrate, not args.no_input)
+    server.capture = capture
     signal.signal(signal.SIGINT, lambda *_: server.stop())
     signal.signal(signal.SIGTERM, lambda *_: server.stop())
     server.run()
