@@ -85,6 +85,7 @@ surface-wireless-monitor/
 │       └── modprobe.d/             Kernel module tuning (Wi-Fi power save off, …)
 ├── docs/
 │   └── HOST-DEPS-Void.md           Host dependency guide for Void Linux
+├── overlay-local/                  Local secrets — Wi-Fi credentials + SSH keys (git-ignored)
 ├── legacy/
 │   └── zips/                       Archived zip iterations v1–v6 (see Version history)
 └── build/                          Build scratch + ISO output (git-ignored)
@@ -288,6 +289,34 @@ sp7-receiver.py [--host IP] [--video-port 5004] [--input-port 5005]
                 [--no-input] [--width W] [--height H] [--verbose]
 ```
 
+### Pre-loaded Wi-Fi and SSH access
+
+The build can bake in credentials so the Surface comes up on the network and is
+reachable over SSH with no manual setup:
+
+- **Wi-Fi** — NetworkManager auto-connects to the configured networks on boot.
+- **SSH** — `openssh-server` runs on boot. From a machine holding the matching
+  private key:
+  ```bash
+  ssh root@sp7-monitor.local        # mDNS hostname (or use the IP)
+  ```
+
+These secrets live in **`overlay-local/`** — a git-ignored directory the build
+script overlays onto the live system at build time (Step 6). They are kept out
+of version control because this repository is public. Recreate it on any build
+machine with this layout:
+
+```
+overlay-local/
+├── etc/NetworkManager/system-connections/<name>.nmconnection   (chmod 600)
+└── root/.ssh/authorized_keys                                   (chmod 600)
+```
+
+`.nmconnection` files are NetworkManager keyfiles; remove any `interface-name=`
+line so they bind to whatever Wi-Fi device the Surface has. If `overlay-local/`
+is absent the build still succeeds — it just produces an ISO with no pre-loaded
+Wi-Fi or SSH key.
+
 ---
 
 ## Software components
@@ -388,6 +417,7 @@ onward each change is a git commit.
 | **v6** | ISO volume label `SP7-MONITOR` → `SP7MONITOR` — a hyphen is not a valid ISO9660 identifier character and broke the GRUB label search. |
 | **v7** | `debootstrap`: added `--components=main,contrib,non-free,non-free-firmware` so firmware/VA-API packages resolve; removed the non-existent `python3-asyncio` package. |
 | **v8** | Removed the VA-API driver variants `i965-va-driver-shaders` and `intel-media-va-driver-non-free` from the debootstrap include list — they `Conflict` with the standard drivers pulled in by `va-driver-all`, and debootstrap's raw `dpkg` cannot resolve that the way `apt` can. |
+| **v9** | Pre-load Wi-Fi and SSH: added `network-manager` and `openssh-server`, dropped `dhcpcd5`; the build now overlays a git-ignored `overlay-local/` tree carrying NetworkManager connections and `authorized_keys`, and enables the `NetworkManager` and `ssh` services. |
 
 ---
 

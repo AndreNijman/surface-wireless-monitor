@@ -122,7 +122,7 @@ debootstrap \
     --arch="${ARCH}" \
     --variant=minbase \
     --components=main,contrib,non-free,non-free-firmware \
-    --include=linux-image-amd64,systemd,systemd-sysv,udev,dbus,kmod,pciutils,usbutils,wireless-tools,wpasupplicant,iw,firmware-iwlwifi,firmware-linux-nonfree,firmware-misc-nonfree,ca-certificates,curl,wget,iputils-ping,iproute2,net-tools,dhcpcd5,openssh-client,avahi-daemon,avahi-utils,libnss-mdns,gstreamer1.0-tools,gstreamer1.0-plugins-base,gstreamer1.0-plugins-good,gstreamer1.0-plugins-bad,gstreamer1.0-vaapi,gstreamer1.0-libav,libgstreamer1.0-0,va-driver-all,mesa-utils,python3,python3-pip,python3-gst-1.0,python3-evdev,xserver-xorg-core,xserver-xorg-video-intel,xserver-xorg-input-libinput,libinput-tools,unclutter,x11-xserver-utils,fonts-dejavu-core,console-setup,keyboard-configuration,dbus-user-session,polkitd,libspa-0.2-bluetooth,pipewire,wireplumber,python3-websocket,python3-aiohttp,less,vim-tiny,whiptail,locales,live-boot,live-config,live-config-systemd,live-tools,debootstrap,squashfs-tools \
+    --include=linux-image-amd64,systemd,systemd-sysv,udev,dbus,kmod,pciutils,usbutils,wireless-tools,wpasupplicant,iw,firmware-iwlwifi,firmware-linux-nonfree,firmware-misc-nonfree,ca-certificates,curl,wget,iputils-ping,iproute2,net-tools,openssh-client,openssh-server,network-manager,avahi-daemon,avahi-utils,libnss-mdns,gstreamer1.0-tools,gstreamer1.0-plugins-base,gstreamer1.0-plugins-good,gstreamer1.0-plugins-bad,gstreamer1.0-vaapi,gstreamer1.0-libav,libgstreamer1.0-0,va-driver-all,mesa-utils,python3,python3-pip,python3-gst-1.0,python3-evdev,xserver-xorg-core,xserver-xorg-video-intel,xserver-xorg-input-libinput,libinput-tools,unclutter,x11-xserver-utils,fonts-dejavu-core,console-setup,keyboard-configuration,dbus-user-session,polkitd,libspa-0.2-bluetooth,pipewire,wireplumber,python3-websocket,python3-aiohttp,less,vim-tiny,whiptail,locales,live-boot,live-config,live-config-systemd,live-tools,debootstrap,squashfs-tools \
     "${DEBIAN_VERSION}" \
     "${CHROOT_DIR}" \
     "${MIRROR}"
@@ -220,8 +220,18 @@ chmod +x "${CHROOT_DIR}/usr/local/bin/sp7-monitor"
 # Copy overlay files
 rsync -a "${OVERLAY_DIR}/" "${CHROOT_DIR}/"
 
-# Make systemd service enabled
+# Copy local overlay if present (git-ignored: Wi-Fi credentials, SSH keys).
+# See overlay-local/ — kept out of version control so secrets never reach
+# the public repository, but baked into the ISO at build time.
+if [ -d "${SCRIPT_DIR}/overlay-local" ]; then
+    info "Applying local overlay (network configs, SSH keys)..."
+    rsync -a "${SCRIPT_DIR}/overlay-local/" "${CHROOT_DIR}/"
+fi
+
+# Enable services: receiver, NetworkManager (Wi-Fi auto-connect), SSH server
 chroot "${CHROOT_DIR}" systemctl enable sp7-monitor
+chroot "${CHROOT_DIR}" systemctl enable NetworkManager
+chroot "${CHROOT_DIR}" systemctl enable ssh
 
 ok "Receiver application installed"
 
